@@ -1,16 +1,16 @@
 package main
 
 import (
-	"log"
-	"net/http"
-
 	"github.com/gin-gonic/gin"
 	"github.com/utauinuneruneko/campaign_workflow_engine/internal/db"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/router"
+	"log"
+	"net/http"
 )
 
 func main() {
 	// 1. 初始化数据库
-	_, err := db.InitDB()
+	database, err := db.InitDB()
 	if err != nil {
 		log.Fatalf("Database initialization failed: %v", err)
 	}
@@ -26,9 +26,12 @@ func main() {
 		})
 	})
 
+	router.RegisterRoutes(r, database)
+
 	// 3. 启动
 	log.Println("Server is running on http://localhost:8080")
 	if err := r.Run(":8080"); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
+
 }
