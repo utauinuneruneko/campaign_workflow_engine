@@ -2,13 +2,12 @@ package handler
 
 import (
 	"errors"
-	"net/http"
-	"strconv"
-	"strings"
-
 	"github.com/gin-gonic/gin"
 	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
 	"gorm.io/gorm"
+	"net/http"
+	"strconv"
+	"strings"
 )
 
 type CampaignHandler struct {

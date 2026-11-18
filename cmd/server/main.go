@@ -1,11 +1,12 @@
 package main
 
 import (
+	"log"
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	"github.com/utauinuneruneko/campaign_workflow_engine/internal/db"
 	"github.com/utauinuneruneko/campaign_workflow_engine/internal/router"
-	"log"
-	"net/http"
 )
 
 func main() {
@@ -33,5 +34,4 @@ func main() {
 	if err := r.Run(":8080"); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
-
 }
