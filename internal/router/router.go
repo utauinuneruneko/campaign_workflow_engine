@@ -15,7 +15,9 @@ func RegisterRoutes(r *gin.Engine, db *gorm.DB) {
 		api.POST("/campaigns", campaigns.CreateCampaign)
 		api.GET("/campaigns", campaigns.ListCampaigns)
 		api.GET("/campaigns/:id", campaigns.GetCampaignByID)
-
-		api.POST("/worker/run-once", workerHandler.RunOnce)
+		api.POST("/campaigns/:id/submit", campaigns.SubmitCampaign)
+		api.POST("/campaigns/:id/approve", campaigns.ApproveCampaign)
+		api.POST("/campaigns/:id/cancel", campaigns.CancelCampaign)
+		api.POST("/internal/worker/run-once", workerHandler.RunOnce)
 	}
 }
