@@ -2,14 +2,13 @@ package handler
 
 import (
 	"errors"
+	"github.com/gin-gonic/gin"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
+	"gorm.io/gorm"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
-
-	"campaign_workflow_engine/internal/model"
-	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 type CampaignHandler struct {

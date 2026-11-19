@@ -2,11 +2,10 @@ package db
 
 import (
 	"fmt"
-	"log"
-
 	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	"log"
 )
 
 func InitDB() (*gorm.DB, error) {
