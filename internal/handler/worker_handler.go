@@ -2,11 +2,10 @@ package handler
 
 import (
 	"errors"
-	"net/http"
-
-	"campaign_workflow_engine/internal/worker"
 	"github.com/gin-gonic/gin"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/worker"
 	"gorm.io/gorm"
+	"net/http"
 )
 
 type WorkerHandler struct {

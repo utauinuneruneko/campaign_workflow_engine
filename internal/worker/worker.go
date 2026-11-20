@@ -3,10 +3,9 @@ package worker
 import (
 	"errors"
 	"fmt"
-	"time"
-
-	"campaign_workflow_engine/internal/model"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
 	"gorm.io/gorm"
+	"time"
 )
 
 const WorkflowPeriod = 7 * 24 * time.Hour

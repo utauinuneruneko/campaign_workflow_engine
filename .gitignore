@@ -1,0 +1,38 @@
+# --- Database files ---
+# 忽略所有 SQLite 数据库文件
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# --- Go specific ---
+# 忽略编译后的二进制文件
+/bin/
+/out/
+campaign_workflow_engine
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 忽略依赖文件夹（如果你使用了 vendor 模式）
+# vendor/
+
+# --- JetBrains (GoLand) specific ---
+# 忽略 GoLand 的配置文件夹
+.idea/
+*.iwu
+*.iws
+out/
+
+# --- OS specific ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# --- Test coverage ---
+*.out
+*.prof

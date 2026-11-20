@@ -2,13 +2,13 @@ package handler
 
 import (
 	"errors"
+	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
+	"gorm.io/gorm"
 	"net/http"
 	"strconv"
 	"time"
-
-	"campaign_workflow_engine/internal/model"
-	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
 )
 
 type workflowDeliveryRequest struct {
@@ -99,8 +99,8 @@ func (h *WorkerHandler) WorkflowDelivery(c *gin.Context) {
 }
 
 var (
-	errWorkflowNotRunning            = errors.New("workflow is not running")
-	errWorkflowDeliveryClosed        = errors.New("workflow delivery period is closed")
-	errSpendExceedsWorkflowBudget    = errors.New("amount exceeds remaining workflow budget")
-	errSpendExceedsCampaignBudget   = errors.New("amount exceeds remaining campaign budget")
+	errWorkflowNotRunning         = errors.New("workflow is not running")
+	errWorkflowDeliveryClosed     = errors.New("workflow delivery period is closed")
+	errSpendExceedsWorkflowBudget = errors.New("amount exceeds remaining workflow budget")
+	errSpendExceedsCampaignBudget = errors.New("amount exceeds remaining campaign budget")
 )
