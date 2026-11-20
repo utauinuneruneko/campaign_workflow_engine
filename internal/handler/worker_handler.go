@@ -2,10 +2,11 @@ package handler
 
 import (
 	"errors"
-	"github.com/gin-gonic/gin"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/worker"
-	"gorm.io/gorm"
 	"net/http"
+
+	"campaign_workflow_engine/internal/worker"
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 type WorkerHandler struct {
@@ -23,9 +24,9 @@ func (h *WorkerHandler) RunOnce(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to process task"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start workflow"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "completed"})
+	c.JSON(http.StatusOK, gin.H{"status": "running"})
 }

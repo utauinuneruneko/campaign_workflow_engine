@@ -3,20 +3,18 @@ package worker
 import (
 	"errors"
 	"fmt"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
-	"gorm.io/gorm"
 	"time"
+
+	"campaign_workflow_engine/internal/model"
+	"gorm.io/gorm"
 )
 
 var ErrNoPendingTask = errors.New("no eligible pending task")
 
-// RunWorkerOnce completes expired deliveries and processes the oldest eligible task.
-// A workflow failure is recorded on that task only; it does not change campaign status.
+// RunWorkerOnce completes expired campaign deliveries and starts the oldest
+// scheduled workflow. Delivery spending is recorded separately by the API.
 func RunWorkerOnce(db *gorm.DB) error {
-	var task model.WorkflowTask
-	noTask := false
-
-	err := db.Transaction(func(tx *gorm.DB) error {
+	return db.Transaction(func(tx *gorm.DB) error {
 		now := time.Now()
 		if err := tx.Model(&model.Campaign{}).
 			Where("status = ? AND end_time <= ?", model.CampaignStatusDelivering, now).
@@ -24,19 +22,17 @@ func RunWorkerOnce(db *gorm.DB) error {
 			return fmt.Errorf("complete expired campaigns: %w", err)
 		}
 
-		// APPROVED campaigns may begin workflow execution; DELIVERING campaigns
-		// may have additional tasks in their workflow task set.
+		var task model.WorkflowTask
 		err := tx.Joins("JOIN campaigns ON campaigns.id = workflow_tasks.campaign_id").
-			Where("workflow_tasks.status = ? AND campaigns.status IN ? AND campaigns.budget > ? AND campaigns.end_time > ?",
+			Where("workflow_tasks.status = ? AND campaigns.status IN ? AND campaigns.budget > ? AND campaigns.end_time > ? AND workflow_tasks.start_at <= ? AND workflow_tasks.end_at > ?",
 				model.WorkflowTaskStatusPending,
 				[]model.CampaignStatus{model.CampaignStatusApproved, model.CampaignStatusDelivering},
-				0, now).
+				0, now, now, now).
 			Order("workflow_tasks.created_at ASC").
 			Order("workflow_tasks.id ASC").
 			First(&task).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			noTask = true
-			return nil
+			return ErrNoPendingTask
 		}
 		if err != nil {
 			return fmt.Errorf("find eligible pending task: %w", err)
@@ -49,69 +45,27 @@ func RunWorkerOnce(db *gorm.DB) error {
 			return fmt.Errorf("mark task running: %w", claimed.Error)
 		}
 		if claimed.RowsAffected == 0 {
-			noTask = true
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if noTask {
-		return ErrNoPendingTask
-	}
-
-	processErr := db.Transaction(func(tx *gorm.DB) error {
-		if task.TaskType != model.WorkflowTaskTypeStartDelivery {
-			return fmt.Errorf("unsupported task type %q", task.TaskType)
+			return ErrNoPendingTask
 		}
 
-		// The first task transitions APPROVED -> DELIVERING. Further tasks for
-		// the same campaign can run while it is DELIVERING.
-		result := tx.Model(&model.Campaign{}).
+		// The campaign enters delivery when its first workflow starts. Additional
+		// workflow tasks may run while the campaign is already DELIVERING.
+		started := tx.Model(&model.Campaign{}).
 			Where("id = ? AND status = ? AND budget > ? AND end_time > ?",
-				task.CampaignID, model.CampaignStatusApproved, 0, time.Now()).
+				task.CampaignID, model.CampaignStatusApproved, 0, now).
 			Update("status", model.CampaignStatusDelivering)
-		if result.Error != nil {
-			return fmt.Errorf("start campaign delivery: %w", result.Error)
+		if started.Error != nil {
+			return fmt.Errorf("start campaign delivery: %w", started.Error)
 		}
-		if result.RowsAffected == 0 {
+		if started.RowsAffected == 0 {
 			var campaign model.Campaign
 			if err := tx.First(&campaign, task.CampaignID).Error; err != nil {
 				return fmt.Errorf("load campaign: %w", err)
 			}
-			if campaign.Status != model.CampaignStatusDelivering || campaign.Budget <= 0 || !campaign.EndTime.After(time.Now()) {
-				return fmt.Errorf("campaign %d is no longer eligible for workflow execution", task.CampaignID)
+			if campaign.Status != model.CampaignStatusDelivering || campaign.Budget <= 0 || !campaign.EndTime.After(now) {
+				return fmt.Errorf("campaign %d is not eligible for delivery", task.CampaignID)
 			}
-		}
-
-		result = tx.Model(&model.WorkflowTask{}).
-			Where("id = ? AND status = ?", task.ID, model.WorkflowTaskStatusRunning).
-			Updates(map[string]interface{}{
-				"status":        model.WorkflowTaskStatusSuccess,
-				"error_message": "",
-			})
-		if result.Error != nil {
-			return fmt.Errorf("mark task successful: %w", result.Error)
-		}
-		if result.RowsAffected == 0 {
-			return fmt.Errorf("task %d is no longer running", task.ID)
 		}
 		return nil
 	})
-	if processErr != nil {
-		message := processErr.Error()
-		if len(message) > 512 {
-			message = message[:512]
-		}
-		if err := db.Model(&model.WorkflowTask{}).
-			Where("id = ? AND status = ?", task.ID, model.WorkflowTaskStatusRunning).
-			Updates(map[string]interface{}{
-				"status":        model.WorkflowTaskStatusFailed,
-				"error_message": message,
-			}).Error; err != nil {
-			return fmt.Errorf("process task: %v; record task failure: %w", processErr, err)
-		}
-		return processErr
-	}
-	return nil
 }
