@@ -3,7 +3,6 @@ package handler
 import (
 	"errors"
 	"fmt"
-	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -91,48 +90,36 @@ func (h *CampaignHandler) GetCampaignByID(c *gin.Context) {
 	if !ok {
 		return
 	}
-
 	var campaign model.Campaign
-	err := h.db.First(&campaign, id).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	if err := h.db.First(&campaign, id).Error; errors.Is(err, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "campaign not found"})
 		return
-	}
-	if err != nil {
+	} else if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch campaign"})
 		return
 	}
-
 	workflows := make([]campaignWorkflowSummary, 0)
 	if err := h.db.Model(&model.WorkflowTask{}).
 		Select("id, status, start_at, end_at, budget").
 		Where("campaign_id = ?", campaign.ID).
-		Order("start_at ASC").
-		Order("id ASC").
-		Scan(&workflows).Error; err != nil {
+		Order("start_at ASC").Order("id ASC").Scan(&workflows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch campaign workflows"})
 		return
 	}
-
-	c.JSON(http.StatusOK, campaignDetailResponse{
-		Campaign:     campaign,
-		WorkflowTasks: workflows,
-	})
+	c.JSON(http.StatusOK, campaignDetailResponse{Campaign: campaign, WorkflowTasks: workflows})
 }
 
 func (h *CampaignHandler) SubmitCampaign(c *gin.Context) {
 	h.transitionCampaign(c, model.CampaignStatusDraft, model.CampaignStatusSubmitted)
 }
 
-// ApproveCampaign creates the scheduled workflow tasks and approves the campaign
-// atomically. Every task covers at least seven days; any extra days are placed
-// in the first task's period.
+// ApproveCampaign approves a submitted campaign. Workflow records are created
+// later, one at a time, by the worker when their scheduled start time arrives.
 func (h *CampaignHandler) ApproveCampaign(c *gin.Context) {
 	id, ok := campaignID(c)
 	if !ok {
 		return
 	}
-
 	now := time.Now()
 	err := h.db.Transaction(func(tx *gorm.DB) error {
 		var campaign model.Campaign
@@ -145,60 +132,17 @@ func (h *CampaignHandler) ApproveCampaign(c *gin.Context) {
 		if campaign.Budget <= 0 {
 			return errCampaignBudgetRequired
 		}
-
-		term := campaign.EndTime.Sub(now)
-		if term < workflowPeriod {
+		if campaign.EndTime.Sub(now) < workflowPeriod {
 			return errCampaignTermTooShort
 		}
-		taskCount := int(math.Ceil(float64(term) / float64(workflowPeriod)))
-		firstPeriod := term - time.Duration(taskCount-1)*workflowPeriod
-		remainingTerm := term
-		remainingBudget := campaign.Budget
-		tasks := make([]model.WorkflowTask, 0, taskCount)
-		periodStart := now
-		for i := 0; i < taskCount; i++ {
-			period := workflowPeriod
-			if i == 0 {
-				period = firstPeriod
-			}
-			periodBudget := remainingBudget
-			if i < taskCount-1 {
-				periodBudget = remainingBudget * float64(period) / float64(remainingTerm)
-			}
-			periodEnd := periodStart.Add(period)
-			if i == taskCount-1 {
-				periodEnd = campaign.EndTime
-				period = periodEnd.Sub(periodStart)
-				periodBudget = remainingBudget
-			}
-			tasks = append(tasks, model.WorkflowTask{
-				CampaignID:     campaign.ID,
-				TaskType:       model.WorkflowTaskTypeStartDelivery,
-				Status:         model.WorkflowTaskStatusPending,
-				Budget:         periodBudget,
-				StartAt:        periodStart,
-				EndAt:          periodEnd,
-				IdempotencyKey: fmt.Sprintf("campaign-%d-delivery-%d", campaign.ID, i+1),
-			})
-			remainingBudget -= periodBudget
-			remainingTerm -= period
-			periodStart = periodEnd
-		}
-
 		result := tx.Model(&model.Campaign{}).
 			Where("id = ? AND status = ?", id, model.CampaignStatusSubmitted).
-			Updates(map[string]interface{}{
-				"status":     model.CampaignStatusApproved,
-				"started_at": now,
-			})
+			Updates(map[string]interface{}{"status": model.CampaignStatusApproved, "started_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
 			return errInvalidCampaignTransition
-		}
-		if err := tx.Create(&tasks).Error; err != nil {
-			return fmt.Errorf("create campaign workflow tasks: %w", err)
 		}
 		return nil
 	})
@@ -229,9 +173,7 @@ func (h *CampaignHandler) transitionCampaign(c *gin.Context, from, to model.Camp
 	if !ok {
 		return
 	}
-	result := h.db.Model(&model.Campaign{}).
-		Where("id = ? AND status = ?", id, from).
-		Update("status", to)
+	result := h.db.Model(&model.Campaign{}).Where("id = ? AND status = ?", id, from).Update("status", to)
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update campaign status"})
 		return
