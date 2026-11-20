@@ -23,9 +23,9 @@ func (h *WorkerHandler) RunOnce(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to process task"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start workflow"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "completed"})
+	c.JSON(http.StatusOK, gin.H{"status": "running"})
 }
