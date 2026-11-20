@@ -37,6 +37,19 @@ type createCampaignRequest struct {
 	EndTime      time.Time `json:"end_time" binding:"required"`
 }
 
+type campaignWorkflowSummary struct {
+	ID      uint                     `json:"id"`
+	Status  model.WorkflowTaskStatus `json:"status"`
+	StartAt time.Time                `json:"start_at"`
+	EndAt   time.Time                `json:"end_at"`
+	Budget  float64                  `json:"budget"`
+}
+
+type campaignDetailResponse struct {
+	model.Campaign
+	WorkflowTasks []campaignWorkflowSummary `json:"workflow_tasks"`
+}
+
 func (h *CampaignHandler) CreateCampaign(c *gin.Context) {
 	var req createCampaignRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -78,6 +91,7 @@ func (h *CampaignHandler) GetCampaignByID(c *gin.Context) {
 	if !ok {
 		return
 	}
+
 	var campaign model.Campaign
 	err := h.db.First(&campaign, id).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -88,7 +102,22 @@ func (h *CampaignHandler) GetCampaignByID(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch campaign"})
 		return
 	}
-	c.JSON(http.StatusOK, campaign)
+
+	workflows := make([]campaignWorkflowSummary, 0)
+	if err := h.db.Model(&model.WorkflowTask{}).
+		Select("id, status, start_at, end_at, budget").
+		Where("campaign_id = ?", campaign.ID).
+		Order("start_at ASC").
+		Order("id ASC").
+		Scan(&workflows).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch campaign workflows"})
+		return
+	}
+
+	c.JSON(http.StatusOK, campaignDetailResponse{
+		Campaign:     campaign,
+		WorkflowTasks: workflows,
+	})
 }
 
 func (h *CampaignHandler) SubmitCampaign(c *gin.Context) {
