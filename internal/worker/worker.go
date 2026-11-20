@@ -123,7 +123,6 @@ func RunWorkerOnce(db *gorm.DB) error {
 			}
 			next := model.WorkflowTask{
 				CampaignID:     campaign.ID,
-				TaskType:       model.WorkflowTaskTypeStartDelivery,
 				Status:         model.WorkflowTaskStatusPending,
 				Budget:         allocated,
 				StartAt:        startAt,

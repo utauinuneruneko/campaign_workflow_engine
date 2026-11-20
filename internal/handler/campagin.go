@@ -32,6 +32,7 @@ type createCampaignRequest struct {
 	Name         string    `json:"name" binding:"required,max=128"`
 	AdvertiserID string    `json:"advertiser_id" binding:"required,max=64"`
 	Budget       float64   `json:"budget" binding:"required,gt=0"`
+	StartTime    time.Time `json:"start_time" binding:"required"`
 	EndTime      time.Time `json:"end_time" binding:"required"`
 }
 
@@ -66,6 +67,7 @@ func (h *CampaignHandler) CreateCampaign(c *gin.Context) {
 		AdvertiserID: req.AdvertiserID,
 		Budget:       req.Budget,
 		Status:       model.CampaignStatusDraft,
+		StartTime:    req.StartTime,
 		EndTime:      req.EndTime,
 	}
 	if err := h.db.Create(&campaign).Error; err != nil {
