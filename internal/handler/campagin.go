@@ -20,27 +20,24 @@ var (
 	errCampaignBudgetRequired    = errors.New("campaign budget must be positive")
 )
 
-type CampaignHandler struct {
-	db *gorm.DB
-}
+type CampaignHandler struct{ db *gorm.DB }
 
-func NewCampaignHandler(db *gorm.DB) *CampaignHandler {
-	return &CampaignHandler{db: db}
-}
+func NewCampaignHandler(db *gorm.DB) *CampaignHandler { return &CampaignHandler{db: db} }
 
 type createCampaignRequest struct {
 	Name         string    `json:"name" binding:"required,max=128"`
 	AdvertiserID string    `json:"advertiser_id" binding:"required,max=64"`
-	Budget       float64   `json:"budget" binding:"required,gt=0"`
+	Budget       int64     `json:"budget" binding:"required,gt=0"`
+	StartTime    time.Time `json:"start_time" binding:"required"`
 	EndTime      time.Time `json:"end_time" binding:"required"`
 }
 
 type campaignWorkflowSummary struct {
-	ID      uint                     `json:"id"`
-	Status  model.WorkflowTaskStatus `json:"status"`
-	StartAt time.Time                `json:"start_at"`
-	EndAt   time.Time                `json:"end_at"`
-	Budget  float64                  `json:"budget"`
+	ID        int64                    `json:"id"`
+	Status    model.WorkflowTaskStatus `json:"status"`
+	StartTime time.Time                `json:"start_time"`
+	EndTime   time.Time                `json:"end_time"`
+	Budget    int64                    `json:"budget"`
 }
 
 type campaignDetailResponse struct {
@@ -56,25 +53,17 @@ func (h *CampaignHandler) CreateCampaign(c *gin.Context) {
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	req.AdvertiserID = strings.TrimSpace(req.AdvertiserID)
-	if req.Name == "" || req.AdvertiserID == "" || !req.EndTime.After(time.Now()) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name and advertiser_id must be non-blank and end_time must be in the future"})
+	if req.Name == "" || req.AdvertiserID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and advertiser_id must not be blank"})
 		return
 	}
-
-	campaign := model.Campaign{
-		Name:         req.Name,
-		AdvertiserID: req.AdvertiserID,
-		Budget:       req.Budget,
-		Status:       model.CampaignStatusDraft,
-		EndTime:      req.EndTime,
-	}
+	campaign := model.Campaign{Name: req.Name, AdvertiserID: req.AdvertiserID, Budget: req.Budget, Status: model.CampaignStatusDraft, StartTime: req.StartTime, EndTime: req.EndTime}
 	if err := h.db.Create(&campaign).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create campaign"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusCreated, campaign)
 }
-
 func (h *CampaignHandler) ListCampaigns(c *gin.Context) {
 	var campaigns []model.Campaign
 	if err := h.db.Find(&campaigns).Error; err != nil {
@@ -83,7 +72,6 @@ func (h *CampaignHandler) ListCampaigns(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, campaigns)
 }
-
 func (h *CampaignHandler) GetCampaignByID(c *gin.Context) {
 	id, ok := campaignID(c)
 	if !ok {
@@ -98,22 +86,15 @@ func (h *CampaignHandler) GetCampaignByID(c *gin.Context) {
 		return
 	}
 	workflows := make([]campaignWorkflowSummary, 0)
-	if err := h.db.Model(&model.WorkflowTask{}).
-		Select("id, status, start_at, end_at, budget").
-		Where("campaign_id = ?", campaign.ID).
-		Order("start_at ASC").Order("id ASC").Scan(&workflows).Error; err != nil {
+	if err := h.db.Model(&model.WorkflowTask{}).Select("id,status,start_time,end_time,budget").Where("campaign_id = ?", campaign.ID).Order("start_time ASC").Order("id ASC").Scan(&workflows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch campaign workflows"})
 		return
 	}
 	c.JSON(http.StatusOK, campaignDetailResponse{Campaign: campaign, WorkflowTasks: workflows})
 }
-
 func (h *CampaignHandler) SubmitCampaign(c *gin.Context) {
 	h.transitionCampaign(c, model.CampaignStatusDraft, model.CampaignStatusSubmitted)
 }
-
-// ApproveCampaign approves a submitted campaign. Workflow records are created
-// later, one at a time, by the worker when their scheduled start time arrives.
 func (h *CampaignHandler) ApproveCampaign(c *gin.Context) {
 	id, ok := campaignID(c)
 	if !ok {
@@ -131,31 +112,29 @@ func (h *CampaignHandler) ApproveCampaign(c *gin.Context) {
 		if campaign.Budget <= 0 {
 			return errCampaignBudgetRequired
 		}
-		if campaign.EndTime.Sub(now) < workflowPeriod {
+		if campaign.EndTime.Sub(campaign.StartTime) < model.MinimumCampaignDuration {
 			return errCampaignTermTooShort
 		}
-		result := tx.Model(&model.Campaign{}).
-			Where("id = ? AND status = ?", id, model.CampaignStatusSubmitted).
-			Updates(map[string]interface{}{"status": model.CampaignStatusApproved, "started_at": now})
+		result := tx.Model(&model.Campaign{}).Where("id = ? AND status = ?", id, model.CampaignStatusSubmitted).UpdateColumns(map[string]interface{}{"status": model.CampaignStatusApproved, "approved_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
 			return errInvalidCampaignTransition
 		}
+		if !now.Before(campaign.StartTime) {
+			return tx.Create(&model.WorkflowTask{CampaignID: campaign.ID, Status: model.WorkflowTaskStatusPending, Budget: campaign.Budget, StartTime: campaign.StartTime, EndTime: campaign.EndTime, IdempotencyKey: "campaign-" + strconv.FormatInt(campaign.ID, 10) + "-initial-workflow"}).Error
+		}
 		return nil
 	})
 	h.respondCampaignMutation(c, err, "campaign approved")
 }
-
 func (h *CampaignHandler) CancelCampaign(c *gin.Context) {
 	id, ok := campaignID(c)
 	if !ok {
 		return
 	}
-	result := h.db.Model(&model.Campaign{}).
-		Where("id = ? AND status IN ?", id, []model.CampaignStatus{model.CampaignStatusDraft, model.CampaignStatusSubmitted}).
-		Update("status", model.CampaignStatusCancelled)
+	result := h.db.Model(&model.Campaign{}).Where("id = ? AND status IN ?", id, []model.CampaignStatus{model.CampaignStatusDraft, model.CampaignStatusSubmitted}).Update("status", model.CampaignStatusCancelled)
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to cancel campaign"})
 		return
@@ -166,13 +145,16 @@ func (h *CampaignHandler) CancelCampaign(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "campaign cancelled"})
 }
-
 func (h *CampaignHandler) transitionCampaign(c *gin.Context, from, to model.CampaignStatus) {
 	id, ok := campaignID(c)
 	if !ok {
 		return
 	}
-	result := h.db.Model(&model.Campaign{}).Where("id = ? AND status = ?", id, from).Update("status", to)
+	updates := map[string]interface{}{"status": to}
+	if to == model.CampaignStatusSubmitted {
+		updates["submitted_at"] = time.Now()
+	}
+	result := h.db.Model(&model.Campaign{}).Where("id = ? AND status = ?", id, from).UpdateColumns(updates)
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update campaign status"})
 		return
@@ -183,8 +165,7 @@ func (h *CampaignHandler) transitionCampaign(c *gin.Context, from, to model.Camp
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "campaign status updated"})
 }
-
-func (h *CampaignHandler) respondTransitionNotApplied(c *gin.Context, id uint) {
+func (h *CampaignHandler) respondTransitionNotApplied(c *gin.Context, id int64) {
 	var count int64
 	if err := h.db.Model(&model.Campaign{}).Where("id = ?", id).Count(&count).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to find campaign"})
@@ -196,7 +177,6 @@ func (h *CampaignHandler) respondTransitionNotApplied(c *gin.Context, id uint) {
 	}
 	c.JSON(http.StatusConflict, gin.H{"error": "campaign cannot make the requested status transition"})
 }
-
 func (h *CampaignHandler) respondCampaignMutation(c *gin.Context, err error, message string) {
 	switch {
 	case err == nil:
@@ -211,12 +191,11 @@ func (h *CampaignHandler) respondCampaignMutation(c *gin.Context, err error, mes
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update campaign"})
 	}
 }
-
-func campaignID(c *gin.Context) (uint, bool) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
-	if err != nil || id == 0 {
+func campaignID(c *gin.Context) (int64, bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid campaign ID"})
 		return 0, false
 	}
-	return uint(id), true
+	return id, true
 }

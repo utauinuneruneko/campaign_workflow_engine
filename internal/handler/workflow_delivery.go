@@ -3,23 +3,22 @@ package handler
 import (
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
-	"gorm.io/gorm"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
+	"gorm.io/gorm"
 )
 
 type workflowDeliveryRequest struct {
-	Amount float64 `json:"amount" binding:"required,gt=0"`
+	Amount int64 `json:"amount" binding:"required,gt=0"`
 }
 
-// WorkflowDelivery records a spend against one RUNNING workflow task. The task
-// becomes SUCCESS only when its full allocated budget has been spent.
 func (h *WorkerHandler) WorkflowDelivery(c *gin.Context) {
-	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
-	if err != nil || id == 0 {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workflow ID"})
 		return
 	}
@@ -28,7 +27,6 @@ func (h *WorkerHandler) WorkflowDelivery(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
 	var updated model.WorkflowTask
 	err = h.db.Transaction(func(tx *gorm.DB) error {
 		var task model.WorkflowTask
@@ -41,49 +39,37 @@ func (h *WorkerHandler) WorkflowDelivery(c *gin.Context) {
 		if req.Amount > task.Budget-task.SpentBudget {
 			return errSpendExceedsWorkflowBudget
 		}
-
 		var campaign model.Campaign
 		if err := tx.First(&campaign, task.CampaignID).Error; err != nil {
 			return err
 		}
 		now := time.Now()
-		if campaign.Status != model.CampaignStatusDelivering || !campaign.EndTime.After(now) || !task.EndAt.After(now) {
+		if campaign.Status != model.CampaignStatusDelivering || !campaign.EndTime.After(now) || !task.EndTime.After(now) {
 			return errWorkflowDeliveryClosed
 		}
 		if req.Amount > campaign.Budget-campaign.SpentBudget {
 			return errSpendExceedsCampaignBudget
 		}
-
-		spent := task.SpentBudget + req.Amount
 		updates := map[string]interface{}{"spent_budget": gorm.Expr("spent_budget + ?", req.Amount)}
-		if spent >= task.Budget {
+		if task.SpentBudget+req.Amount >= task.Budget {
 			updates["status"] = model.WorkflowTaskStatusSuccess
 		}
-		result := tx.Model(&model.WorkflowTask{}).
-			Where("id = ? AND status = ? AND spent_budget + ? <= budget", task.ID, model.WorkflowTaskStatusRunning, req.Amount).
-			Updates(updates)
+		result := tx.Model(&model.WorkflowTask{}).Where("id = ? AND status = ? AND spent_budget + ? <= budget", task.ID, model.WorkflowTaskStatusRunning, req.Amount).Updates(updates)
 		if result.Error != nil {
 			return fmt.Errorf("record workflow spend: %w", result.Error)
 		}
 		if result.RowsAffected == 0 {
 			return errSpendExceedsWorkflowBudget
 		}
-
-		result = tx.Model(&model.Campaign{}).
-			Where("id = ? AND status = ? AND end_time > ? AND spent_budget + ? <= budget", campaign.ID, model.CampaignStatusDelivering, now, req.Amount).
-			Update("spent_budget", gorm.Expr("spent_budget + ?", req.Amount))
+		result = tx.Model(&model.Campaign{}).Where("id = ? AND status = ? AND end_time > ? AND spent_budget + ? <= budget", campaign.ID, model.CampaignStatusDelivering, now, req.Amount).Update("spent_budget", gorm.Expr("spent_budget + ?", req.Amount))
 		if result.Error != nil {
 			return fmt.Errorf("record campaign spend: %w", result.Error)
 		}
 		if result.RowsAffected == 0 {
 			return errSpendExceedsCampaignBudget
 		}
-		if err := tx.First(&updated, task.ID).Error; err != nil {
-			return err
-		}
-		return nil
+		return tx.First(&updated, task.ID).Error
 	})
-
 	switch {
 	case err == nil:
 		c.JSON(http.StatusOK, gin.H{"workflow": updated, "status": updated.Status})
