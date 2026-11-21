@@ -86,7 +86,7 @@ func (h *CampaignHandler) GetCampaignByID(c *gin.Context) {
 		return
 	}
 	workflows := make([]campaignWorkflowSummary, 0)
-	if err := h.db.Model(&model.WorkflowTask{}).Select("id,status,start_at,end_at,budget").Where("campaign_id = ?", campaign.ID).Order("start_at ASC").Order("id ASC").Scan(&workflows).Error; err != nil {
+	if err := h.db.Model(&model.WorkflowTask{}).Select("id,status,start_time,end_time,budget").Where("campaign_id = ?", campaign.ID).Order("start_time ASC").Order("id ASC").Scan(&workflows).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch campaign workflows"})
 		return
 	}
@@ -115,7 +115,7 @@ func (h *CampaignHandler) ApproveCampaign(c *gin.Context) {
 		if campaign.EndTime.Sub(campaign.StartTime) < model.MinimumCampaignDuration {
 			return errCampaignTermTooShort
 		}
-		result := tx.Model(&model.Campaign{}).Where("id = ? AND status = ?", id, model.CampaignStatusSubmitted).Updates(map[string]interface{}{"status": model.CampaignStatusApproved, "approved_at": now})
+		result := tx.Model(&model.Campaign{}).Where("id = ? AND status = ?", id, model.CampaignStatusSubmitted).UpdateColumns(map[string]interface{}{"status": model.CampaignStatusApproved, "approved_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -154,7 +154,7 @@ func (h *CampaignHandler) transitionCampaign(c *gin.Context, from, to model.Camp
 	if to == model.CampaignStatusSubmitted {
 		updates["submitted_at"] = time.Now()
 	}
-	result := h.db.Model(&model.Campaign{}).Where("id = ? AND status = ?", id, from).Updates(updates)
+	result := h.db.Model(&model.Campaign{}).Where("id = ? AND status = ?", id, from).UpdateColumns(updates)
 	if result.Error != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update campaign status"})
 		return
