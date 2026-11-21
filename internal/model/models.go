@@ -179,19 +179,33 @@ type Campaign struct {
 	Deleted     gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
-func (c *Campaign) BeforeSave(*gorm.DB) error {
+func (c *Campaign) BeforeCreate(tx *gorm.DB) error {
+	// 创建时的严格校验
 	if c.Name == "" {
 		return errors.New("campaign name is required")
 	}
 	if c.EndTime.Sub(c.StartTime) < MinimumCampaignDuration {
 		return fmt.Errorf("campaign duration must be at least %s", MinimumCampaignDuration)
 	}
-	if !c.Status.IsValid() {
-		return fmt.Errorf("invalid campaign status %d", c.Status)
+	if c.Budget <= 0 {
+		return errors.New("initial budget must be positive")
 	}
-	if c.Budget < 0 || c.SpentBudget < 0 || c.SpentBudget > c.Budget {
-		return errors.New("campaign budget values are invalid")
+	return nil
+}
+
+func (c *Campaign) BeforeUpdate(tx *gorm.DB) error {
+	// 更新时的校验：只校验被填充（非零值）的字段
+	if c.Name != "" && len(c.Name) > 128 {
+		return errors.New("campaign name too long")
 	}
+
+	// 如果同时尝试更新两个时间，则校验时长
+	if !c.StartTime.IsZero() && !c.EndTime.IsZero() {
+		if c.EndTime.Sub(c.StartTime) < MinimumCampaignDuration {
+			return fmt.Errorf("campaign duration must be at least %s", MinimumCampaignDuration)
+		}
+	}
+
 	return nil
 }
 

@@ -117,9 +117,11 @@ func createInitialTask(tx *gorm.DB, campaign model.Campaign) error {
 		return nil
 	}
 	return tx.Create(&model.WorkflowTask{
-		CampaignID: campaign.ID, Status: model.WorkflowTaskStatusPending,
-		Type: model.WorkflowTaskTypeStartDelivery, StartAt: campaign.StartTime,
-		EndAt: campaign.EndTime, Budget: campaign.Budget,
+		CampaignID:     campaign.ID,
+		Status:         model.WorkflowTaskStatusPending,
+		StartTime:      campaign.StartTime,
+		EndTime:        campaign.EndTime,
+		Budget:         campaign.Budget,
 		IdempotencyKey: fmt.Sprintf("campaign-%d-initial-workflow", campaign.ID),
 	}).Error
 }
