@@ -3,17 +3,32 @@ package worker
 import (
 	"errors"
 	"fmt"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
-	"gorm.io/gorm"
 	"math/big"
 	"time"
+
+	"campaign_workflow_engine/internal/clock"
+	"campaign_workflow_engine/internal/model"
+	"gorm.io/gorm"
 )
 
 const WorkflowPeriod = 7 * 24 * time.Hour
 
 var ErrNoPendingTask = errors.New("no eligible pending task")
 
-// CalculateNextWorkflowBudget 使用 big.Int 确保大额预算计算时不溢出，并按比例分配预算。
+type Worker struct {
+	db    *gorm.DB
+	clock clock.Clock
+}
+
+func NewWorker(db *gorm.DB, clock clock.Clock) *Worker {
+	if clock == nil {
+		clock = clockpkgReal{}
+	}
+	return &Worker{db: db, clock: clock}
+}
+
+// CalculateNextWorkflowBudget allocates integer currency units proportionally.
+// The final workflow gets the remaining budget to avoid rounding residue.
 func CalculateNextWorkflowBudget(totalCampaignDuration, remainingDuration time.Duration, remainingBudget int64, currentWorkflowDuration time.Duration) (int64, error) {
 	if totalCampaignDuration <= 0 {
 		return 0, errors.New("total campaign duration must be positive")
@@ -27,202 +42,159 @@ func CalculateNextWorkflowBudget(totalCampaignDuration, remainingDuration time.D
 	if remainingBudget < 0 {
 		return 0, errors.New("remaining budget cannot be negative")
 	}
-	// 最后一个任务，直接返回剩余所有预算，避免浮点精度损失
 	if currentWorkflowDuration == remainingDuration {
 		return remainingBudget, nil
 	}
-
-	// 使用 big.Int 进行计算: (remainingBudget * currentDuration) / remainingDuration
 	n := new(big.Int).Mul(big.NewInt(remainingBudget), big.NewInt(int64(currentWorkflowDuration)))
 	n.Quo(n, big.NewInt(int64(remainingDuration)))
-
 	if !n.IsInt64() {
 		return 0, errors.New("calculated budget overflows int64")
 	}
 	return n.Int64(), nil
 }
 
-// RunWorkerOnce 驱动工作流流转的主函数
-func RunWorkerOnce(db *gorm.DB) error {
-	var targetTask model.WorkflowTask
-	taskFound := false
-
-	err := db.Transaction(func(tx *gorm.DB) error {
-		now := time.Now()
-
-		// 1. 自动完成过期活动
+// RunOnce completes expired campaigns, creates a due workflow if needed, and
+// transitions one due PENDING workflow to RUNNING. A later workflow is only
+// created after the previous workflow has reached SUCCESS or FAILED.
+func (w *Worker) RunOnce() error {
+	found := false
+	err := w.db.Transaction(func(tx *gorm.DB) error {
+		now := w.clock.Now()
 		if err := tx.Model(&model.Campaign{}).
-			Where("status = ? AND end_time <= ?", model.CampaignStatusDelivering, now).
+			Where("status IN ? AND end_time <= ?", []model.CampaignStatus{model.CampaignStatusApproved, model.CampaignStatusDelivering}, now).
 			Update("status", model.CampaignStatusCompleted).Error; err != nil {
 			return fmt.Errorf("complete expired campaigns: %w", err)
 		}
 
-		// 2. 尝试为符合条件的活动创建下一个 Workflow 任务
-		newTask, created, err := tryCreateNextTask(tx, now)
+		var task model.WorkflowTask
+		created, err := w.createNextDueTask(tx, now, &task)
 		if err != nil {
-			return fmt.Errorf("try create next task: %w", err)
+			return fmt.Errorf("create next workflow: %w", err)
 		}
-
 		if created {
-			targetTask = *newTask
-			taskFound = true
+			found = true
 		} else {
-			// 3. 寻找已经存在但尚未开始的到期任务
-			dueTask, found, err := findDueTask(tx, now)
+			err := tx.Joins("JOIN campaigns ON campaigns.id = workflow_tasks.campaign_id").
+				Where("workflow_tasks.status = ? AND workflow_tasks.start_time <= ? AND workflow_tasks.end_time > ? AND campaigns.status IN ? AND campaigns.end_time > ?",
+					model.WorkflowTaskStatusPending, now, now,
+					[]model.CampaignStatus{model.CampaignStatusApproved, model.CampaignStatusDelivering}, now).
+				Order("workflow_tasks.create_time ASC").Order("workflow_tasks.id ASC").First(&task).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil
+			}
 			if err != nil {
-				return fmt.Errorf("find due task: %w", err)
+				return fmt.Errorf("find due workflow: %w", err)
 			}
-			if !found {
-				return nil // 既没新任务创建，也没到期任务
-			}
-			targetTask = *dueTask
-			taskFound = true
+			found = true
 		}
 
-		// 4. 认领任务并更新活动状态
-		return claimTask(tx, targetTask, now)
+		claim := tx.Model(&model.WorkflowTask{}).
+			Where("id = ? AND status = ? AND start_time <= ?", task.ID, model.WorkflowTaskStatusPending, now).
+			Update("status", model.WorkflowTaskStatusRunning)
+		if claim.Error != nil {
+			return fmt.Errorf("mark workflow running: %w", claim.Error)
+		}
+		if claim.RowsAffected == 0 {
+			found = false
+			return nil
+		}
+		if err := tx.Model(&model.Campaign{}).
+			Where("id = ? AND status = ?", task.CampaignID, model.CampaignStatusApproved).
+			Update("status", model.CampaignStatusDelivering).Error; err != nil {
+			return fmt.Errorf("start campaign delivery: %w", err)
+		}
+		return nil
 	})
-
 	if err != nil {
 		return err
 	}
-	if !taskFound {
+	if !found {
 		return ErrNoPendingTask
 	}
 	return nil
 }
 
-func tryCreateNextTask(tx *gorm.DB, now time.Time) (*model.WorkflowTask, bool, error) {
+func (w *Worker) createNextDueTask(tx *gorm.DB, now time.Time, task *model.WorkflowTask) (bool, error) {
 	var campaigns []model.Campaign
-	// 查找状态为已审核或投递中，且尚未结束的活动
-	err := tx.Where("status IN ? AND budget > ? AND end_time > ?",
-		[]model.CampaignStatus{model.CampaignStatusApproved, model.CampaignStatusDelivering},
-		0, now).
-		Order("approved_at ASC, id ASC").
-		Find(&campaigns).Error
-	if err != nil {
-		return nil, false, err
+	if err := tx.Where("status IN ? AND budget > ? AND end_time > ?",
+		[]model.CampaignStatus{model.CampaignStatusApproved, model.CampaignStatusDelivering}, 0, now).
+		Order("approved_at ASC").Order("id ASC").Find(&campaigns).Error; err != nil {
+		return false, err
 	}
 
-	for _, cp := range campaigns {
-		if cp.ApprovedAt == nil || cp.ApprovedAt.After(now) {
+	for _, campaign := range campaigns {
+		if campaign.ApprovedAt == nil || campaign.ApprovedAt.After(now) || campaign.StartTime.After(now) {
 			continue
 		}
 
-		var prev model.WorkflowTask
-		err := tx.Where("campaign_id = ?", cp.ID).Order("start_time DESC, id DESC").First(&prev).Error
-
-		var startAt time.Time
-		var duration time.Duration
-		isFirst := errors.Is(err, gorm.ErrRecordNotFound)
-
-		if isFirst {
-			if cp.StartTime.After(now) {
-				continue
-			}
-			startAt = cp.StartTime
-			// 首个任务时长 = 7天 + 总时长%7天的余数 (处理非整除情况)
-			totalLen := cp.EndTime.Sub(cp.StartTime)
-			duration = WorkflowPeriod + (totalLen % WorkflowPeriod)
-		} else if err == nil {
-			// 只有前一个任务成功或失败了（终态），才开启下一个
-			if prev.Status != model.WorkflowTaskStatusSuccess && prev.Status != model.WorkflowTaskStatusFailed {
-				continue
-			}
-			startAt = prev.EndTime
-			if startAt.After(now) || !startAt.Before(cp.EndTime) {
-				continue
-			}
-			duration = WorkflowPeriod
-		} else {
-			return nil, false, err
+		var previous model.WorkflowTask
+		previousErr := tx.Where("campaign_id = ?", campaign.ID).
+			Order("start_time DESC").Order("id DESC").First(&previous).Error
+		isFirst := errors.Is(previousErr, gorm.ErrRecordNotFound)
+		if previousErr != nil && !isFirst {
+			return false, previousErr
 		}
 
-		// 修正时长，确保不超限
-		remLen := cp.EndTime.Sub(startAt)
-		if duration > remLen {
-			duration = remLen
+		startAt := campaign.StartTime
+		totalDuration := campaign.EndTime.Sub(campaign.StartTime)
+		remainingDuration := campaign.EndTime.Sub(startAt)
+		duration := WorkflowPeriod + totalDuration%WorkflowPeriod
+		if !isFirst {
+			if previous.Status != model.WorkflowTaskStatusSuccess && previous.Status != model.WorkflowTaskStatusFailed {
+				continue
+			}
+			startAt = previous.EndTime
+			if startAt.After(now) || !startAt.Before(campaign.EndTime) {
+				continue
+			}
+			remainingDuration = campaign.EndTime.Sub(startAt)
+			duration = WorkflowPeriod
+		}
+		if duration > remainingDuration {
+			duration = remainingDuration
 		}
 		if duration <= 0 {
 			continue
 		}
 
-		// 计算该阶段应分配的预算
-		allocated, err := calcBudget(tx, cp, startAt, duration, isFirst)
+		remainingBudget := campaign.Budget
+		if !isFirst {
+			var allocated int64
+			if err := tx.Model(&model.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).
+				Select("COALESCE(SUM(budget), 0)").Scan(&allocated).Error; err != nil {
+				return false, fmt.Errorf("sum allocated workflow budgets: %w", err)
+			}
+			remainingBudget -= allocated
+		}
+		budget, err := CalculateNextWorkflowBudget(totalDuration, remainingDuration, remainingBudget, duration)
 		if err != nil {
-			return nil, false, err
+			return false, err
 		}
 
-		var seq int64
-		tx.Model(&model.WorkflowTask{}).Where("campaign_id = ?", cp.ID).Count(&seq)
-
+		var sequence int64
+		if err := tx.Model(&model.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&sequence).Error; err != nil {
+			return false, err
+		}
 		next := model.WorkflowTask{
-			CampaignID:     cp.ID,
+			CampaignID:     campaign.ID,
 			Status:         model.WorkflowTaskStatusPending,
-			Budget:         allocated,
+			Type:           model.WorkflowTaskTypeStartDelivery,
+			Budget:         budget,
 			StartTime:      startAt,
 			EndTime:        startAt.Add(duration),
-			IdempotencyKey: fmt.Sprintf("cp-%d-task-%d", cp.ID, seq+1),
+			IdempotencyKey: fmt.Sprintf("campaign-%d-delivery-%d", campaign.ID, sequence+1),
 		}
-
 		if err := tx.Create(&next).Error; err != nil {
-			return nil, false, err
+			return false, err
 		}
-		return &next, true, nil
+		*task = next
+		return true, nil
 	}
-	return nil, false, nil
+	return false, nil
 }
 
-func calcBudget(tx *gorm.DB, cp model.Campaign, startAt time.Time, dur time.Duration, isFirst bool) (int64, error) {
-	totalDur := cp.EndTime.Sub(cp.StartTime)
-	remDur := cp.EndTime.Sub(startAt)
+// clockpkgReal is an alias adapter, allowing NewWorker's clock parameter to
+// remain named clock while still providing a safe default when it is nil.
+type clockpkgReal struct{}
 
-	remBudget := cp.Budget
-	if !isFirst {
-		var spent int64
-		// 统计该活动下已分配出去的所有任务预算总和
-		if err := tx.Model(&model.WorkflowTask{}).
-			Where("campaign_id = ?", cp.ID).
-			Select("COALESCE(SUM(budget), 0)").
-			Scan(&spent).Error; err != nil {
-			return 0, err
-		}
-		remBudget = cp.Budget - spent
-	}
-
-	return CalculateNextWorkflowBudget(totalDur, remDur, remBudget, dur)
-}
-
-func findDueTask(tx *gorm.DB, now time.Time) (*model.WorkflowTask, bool, error) {
-	var t model.WorkflowTask
-	err := tx.Joins("JOIN campaigns ON campaigns.id = workflow_tasks.campaign_id").
-		Where("workflow_tasks.status = ? AND workflow_tasks.start_time <= ? AND campaigns.status IN ?",
-			model.WorkflowTaskStatusPending, now,
-			[]model.CampaignStatus{model.CampaignStatusApproved, model.CampaignStatusDelivering}).
-		Order("workflow_tasks.create_time ASC").
-		First(&t).Error
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, false, nil
-	}
-	return &t, err == nil, err
-}
-
-func claimTask(tx *gorm.DB, task model.WorkflowTask, now time.Time) error {
-	// 原子更新任务状态为运行中
-	res := tx.Model(&model.WorkflowTask{}).
-		Where("id = ? AND status = ?", task.ID, model.WorkflowTaskStatusPending).
-		Update("status", model.WorkflowTaskStatusRunning)
-
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return nil
-	}
-
-	// 如果活动还是“已审核”状态，说明这是第一个开始跑的任务，将其转为“投递中”
-	return tx.Model(&model.Campaign{}).
-		Where("id = ? AND status = ?", task.CampaignID, model.CampaignStatusApproved).
-		Update("status", model.CampaignStatusDelivering).Error
-}
+func (clockpkgReal) Now() time.Time { return time.Now() }
