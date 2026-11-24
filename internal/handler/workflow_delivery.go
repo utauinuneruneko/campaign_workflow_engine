@@ -28,7 +28,7 @@ func (h *WorkerHandler) WorkflowDelivery(c *gin.Context) {
 		return
 	}
 	var updated model.WorkflowTask
-	err = h.db.Transaction(func(tx *gorm.DB) error {
+	err = h.worker.GetDB().Transaction(func(tx *gorm.DB) error {
 		var task model.WorkflowTask
 		if err := tx.First(&task, id).Error; err != nil {
 			return err

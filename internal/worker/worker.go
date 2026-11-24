@@ -6,8 +6,8 @@ import (
 	"math/big"
 	"time"
 
-	"campaign_workflow_engine/internal/clock"
-	"campaign_workflow_engine/internal/model"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/clock"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
 	"gorm.io/gorm"
 )
 
@@ -25,6 +25,10 @@ func NewWorker(db *gorm.DB, clock clock.Clock) *Worker {
 		clock = clockpkgReal{}
 	}
 	return &Worker{db: db, clock: clock}
+}
+
+func (w *Worker) GetDB() *gorm.DB {
+	return w.db
 }
 
 // CalculateNextWorkflowBudget allocates integer currency units proportionally.
@@ -178,7 +182,6 @@ func (w *Worker) createNextDueTask(tx *gorm.DB, now time.Time, task *model.Workf
 		next := model.WorkflowTask{
 			CampaignID:     campaign.ID,
 			Status:         model.WorkflowTaskStatusPending,
-			Type:           model.WorkflowTaskTypeStartDelivery,
 			Budget:         budget,
 			StartTime:      startAt,
 			EndTime:        startAt.Add(duration),
