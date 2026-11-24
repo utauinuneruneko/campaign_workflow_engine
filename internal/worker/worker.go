@@ -6,8 +6,8 @@ import (
 	"math/big"
 	"time"
 
-	"campaign_workflow_engine/internal/clock"
-	"campaign_workflow_engine/internal/model"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/clock"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
 	"gorm.io/gorm"
 )
 

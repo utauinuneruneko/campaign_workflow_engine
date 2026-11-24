@@ -64,7 +64,7 @@ func (h *WorkerHandler) recordDelivery(
 	if err := validateDelivery(task, campaign, amount); err != nil {
 		return err
 	}
-	if err := recordWorkflowSpend(tx, task, amount); err != != nil {
+	if err := recordWorkflowSpend(tx, task, amount); err != nil {
 		return err
 	}
 	if err := recordCampaignSpend(tx, campaign, amount); err != nil {
