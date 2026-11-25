@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/big"
@@ -20,6 +21,7 @@ type Worker struct {
 	db         *gorm.DB
 	clock      internal.Clock
 	campaigns  *repo.CampaignRepository
+	workflows  *repo.WorkflowRepository
 }
 
 func NewWorker(db *gorm.DB, c internal.Clock) *Worker {
@@ -30,6 +32,7 @@ func NewWorker(db *gorm.DB, c internal.Clock) *Worker {
 		db:        db,
 		clock:     c,
 		campaigns: repo.NewCampaignRepository(db),
+		workflows: repo.NewWorkflowRepository(db),
 	}
 }
 
@@ -127,11 +130,12 @@ func (w *Worker) completeExpiredCampaigns(tx *gorm.DB, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	campaignRepo := w.campaigns.WithDB(tx)
 	for _, campaign := range campaigns {
 		if !campaignEndReached(campaign, now) {
 			continue
 		}
-		if _, err := w.campaigns.WithDB(tx).UpdateByID(campaign.ID, map[string]interface{}{
+		if _, err := campaignRepo.UpdateByID(campaign.ID, map[string]interface{}{
 			"status": models.CampaignStatusCompleted,
 		}); err != nil {
 			return fmt.Errorf("complete campaign %d: %w", campaign.ID, err)
@@ -155,9 +159,9 @@ func (w *Worker) findDueTask(
 		models.CampaignStatusApproved,
 		models.CampaignStatusDelivering,
 	}
-	var tasks []models.WorkflowTask
-	if err := tx.Order("create_time ASC").Order("id ASC").Find(&tasks).Error; err != nil {
-		return false, fmt.Errorf("list workflow tasks: %w", err)
+	tasks, err := w.workflows.WithDB(tx).List()
+	if err != nil {
+		return false, err
 	}
 	campaigns, err := w.campaigns.WithDB(tx).List()
 	if err != nil {
@@ -207,17 +211,21 @@ func (w *Worker) claimTask(
 	now time.Time,
 	task models.WorkflowTask,
 ) error {
-	result := tx.Model(&models.WorkflowTask{}).
-		Where("id = ? AND status = ? AND start_time <= ?", task.ID, models.WorkflowTaskStatusPending, now).
-		Update("status", models.WorkflowTaskStatusRunning)
-	if result.Error != nil {
-		return fmt.Errorf("mark workflow running: %w", result.Error)
+	workflowRepo := w.workflows.WithDB(tx)
+	current, err := workflowRepo.GetByID(task.ID)
+	if err != nil {
+		return err
 	}
-	if result.RowsAffected == 0 {
+	if current.Status != models.WorkflowTaskStatusPending || current.StartTime.After(now) {
 		return nil
 	}
+	if _, err := workflowRepo.UpdateByID(current.ID, map[string]interface{}{
+		"status": models.WorkflowTaskStatusRunning,
+	}); err != nil {
+		return fmt.Errorf("mark workflow running: %w", err)
+	}
 
-	campaign, err := w.campaigns.WithDB(tx).GetByID(task.CampaignID)
+	campaign, err := w.campaigns.WithDB(tx).GetByID(current.CampaignID)
 	if err != nil {
 		return err
 	}
@@ -248,7 +256,7 @@ func (w *Worker) createNextDueTask(
 		if !ready {
 			continue
 		}
-		if err := tx.Create(&next).Error; err != nil {
+		if err := w.workflows.WithDB(tx).Create(&next); err != nil {
 			return false, fmt.Errorf("create next workflow: %w", err)
 		}
 		*task = next
@@ -337,18 +345,29 @@ func (w *Worker) findPreviousTask(
 	tx *gorm.DB,
 	campaignID int64,
 ) (models.WorkflowTask, bool, error) {
-	var previous models.WorkflowTask
-	err := tx.Where("campaign_id = ?", campaignID).
-		Order("start_time DESC").
-		Order("id DESC").
-		First(&previous).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return models.WorkflowTask{}, true, nil
-	}
+	tasks, err := w.workflows.WithDB(tx).List()
 	if err != nil {
 		return models.WorkflowTask{}, false, err
 	}
-	return previous, false, nil
+	var previous models.WorkflowTask
+	found := false
+	for _, task := range tasks {
+		if task.CampaignID != campaignID {
+			continue
+		}
+		if !found || taskIsLater(task, previous) {
+			previous = task
+			found = true
+		}
+	}
+	return previous, !found, nil
+}
+
+func taskIsLater(candidate, current models.WorkflowTask) bool {
+	if candidate.StartTime.Equal(current.StartTime) {
+		return candidate.ID > current.ID
+	}
+	return candidate.StartTime.After(current.StartTime)
 }
 
 func workflowWindow(
@@ -387,22 +406,29 @@ func (w *Worker) remainingBudget(
 	if isFirst {
 		return campaign.Budget, nil
 	}
+	tasks, err := w.workflows.WithDB(tx).List()
+	if err != nil {
+		return 0, err
+	}
 	var allocated int64
-	if err := tx.Model(&models.WorkflowTask{}).
-		Where("campaign_id = ?", campaign.ID).
-		Select("COALESCE(SUM(budget), 0)").
-		Scan(&allocated).Error; err != nil {
-		return 0, fmt.Errorf("sum allocated workflow budgets: %w", err)
+	for _, task := range tasks {
+		if task.CampaignID == campaign.ID {
+			allocated += task.Budget
+		}
 	}
 	return campaign.Budget - allocated, nil
 }
 
 func (w *Worker) taskSequence(tx *gorm.DB, campaignID int64) (int64, error) {
+	tasks, err := w.workflows.WithDB(tx).List()
+	if err != nil {
+		return 0, err
+	}
 	var sequence int64
-	if err := tx.Model(&models.WorkflowTask{}).
-		Where("campaign_id = ?", campaignID).
-		Count(&sequence).Error; err != nil {
-		return 0, fmt.Errorf("count campaign workflows: %w", err)
+	for _, task := range tasks {
+		if task.CampaignID == campaignID {
+			sequence++
+		}
 	}
 	return sequence, nil
 }
