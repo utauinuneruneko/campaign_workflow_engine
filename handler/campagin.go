@@ -3,15 +3,14 @@ package handler
 import (
 	"errors"
 	"fmt"
-	"net/http"
-	"strconv"
-	"strings"
-	"time"
-
 	"github.com/gin-gonic/gin"
 	"github.com/utauinuneruneko/campaign_workflow_engine/models"
 	"github.com/utauinuneruneko/campaign_workflow_engine/repo"
 	"gorm.io/gorm"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
 )
 
 var (
@@ -222,11 +221,11 @@ func (h *CampaignHandler) CancelCampaign(c *gin.Context) {
 		return
 	}
 	campaign, err := repo.NewCampaignRepository(h.db).GetByID(id)
-	if err != nil {		h.respondCampaignLookupError(c, err)
+	if err != nil {
+		h.respondCampaignLookupError(c, err)
 		return
 	}
-	if campaign.Status != models.CampaignStatusDraft &&
-		campaign.Status != models.CampaignStatusSubmitted {
+	if campaign.Status != models.CampaignStatusDraft && campaign.Status != models.CampaignStatusSubmitted {
 		h.respondInvalidTransition(c)
 		return
 	}
