@@ -72,7 +72,12 @@ func (h *WorkerHandler) recordDelivery(
 	if err := recordCampaignSpend(tx, campaign, amount, now); err != nil {
 		return err
 	}
-	return repo.NewWorkflowRepository(tx).GetInto(task.ID, updated)
+	updatedTask, err := repo.NewWorkflowRepository(tx).GetByID(task.ID)
+	if err != nil {
+		return fmt.Errorf("reload workflow task: %w", err)
+	}
+	*updated = updatedTask
+	return nil
 }
 
 func (h *WorkerHandler) loadDeliveryEntities(
