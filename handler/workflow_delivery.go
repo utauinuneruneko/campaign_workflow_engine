@@ -3,12 +3,14 @@ package handler
 import (
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/utauinuneruneko/campaign_workflow_engine/models"
-	"gorm.io/gorm"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/utauinuneruneko/campaign_workflow_engine/models"
+	"github.com/utauinuneruneko/campaign_workflow_engine/repo"
+	"gorm.io/gorm"
 )
 
 type workflowDeliveryRequest struct {
@@ -60,13 +62,13 @@ func (h *WorkerHandler) recordDelivery(
 	if err != nil {
 		return err
 	}
-	if err := validateDelivery(task, campaign, amount); err != nil {
+	if err := validateDelivery(task, campaign, amount, time.Now()); err != nil {
 		return err
 	}
 	if err := recordWorkflowSpend(tx, task, amount); err != nil {
 		return err
 	}
-	if err := recordCampaignSpend(tx, campaign, amount); err != nil {
+	if err := recordCampaignSpend(tx, campaign, amount, time.Now()); err != nil {
 		return err
 	}
 	return tx.First(updated, task.ID).Error
@@ -80,9 +82,8 @@ func (h *WorkerHandler) loadDeliveryEntities(
 	if err := tx.First(&task, workflowID).Error; err != nil {
 		return models.WorkflowTask{}, models.Campaign{}, err
 	}
-
-	var campaign models.Campaign
-	if err := tx.First(&campaign, task.CampaignID).Error; err != nil {
+	campaign, err := repo.NewCampaignRepository(tx).GetByID(task.CampaignID)
+	if err != nil {
 		return models.WorkflowTask{}, models.Campaign{}, err
 	}
 	return task, campaign, nil
@@ -92,6 +93,7 @@ func validateDelivery(
 	task models.WorkflowTask,
 	campaign models.Campaign,
 	amount int64,
+	now time.Time,
 ) error {
 	if task.Status != models.WorkflowTaskStatusRunning {
 		return errWorkflowNotRunning
@@ -99,8 +101,6 @@ func validateDelivery(
 	if amount > task.Budget-task.SpentBudget {
 		return errSpendExceedsWorkflowBudget
 	}
-
-	now := time.Now()
 	if campaign.Status != models.CampaignStatusDelivering ||
 		!campaign.EndTime.After(now) ||
 		!task.EndTime.After(now) {
@@ -145,22 +145,21 @@ func recordCampaignSpend(
 	tx *gorm.DB,
 	campaign models.Campaign,
 	amount int64,
+	now time.Time,
 ) error {
-	now := time.Now()
-	result := tx.Model(&models.Campaign{}).
-		Where(
-			"id = ? AND status = ? AND end_time > ? "+
-				"AND spent_budget + ? <= budget",
-			campaign.ID,
-			models.CampaignStatusDelivering,
-			now,
-			amount,
-		).
-		Update("spent_budget", gorm.Expr("spent_budget + ?", amount))
-	if result.Error != nil {
-		return fmt.Errorf("record campaign spend: %w", result.Error)
+	if campaign.Status != models.CampaignStatusDelivering ||
+		!campaign.EndTime.After(now) ||
+		amount > campaign.Budget-campaign.SpentBudget {
+		return errSpendExceedsCampaignBudget
 	}
-	if result.RowsAffected == 0 {
+
+	rows, err := repo.NewCampaignRepository(tx).UpdateByID(campaign.ID, map[string]interface{}{
+		"spent_budget": gorm.Expr("spent_budget + ?", amount),
+	})
+	if err != nil {
+		return fmt.Errorf("record campaign spend: %w", err)
+	}
+	if rows == 0 {
 		return errSpendExceedsCampaignBudget
 	}
 	return nil
