@@ -1,8 +1,7 @@
-package db
+package internal
 
 import (
 	"fmt"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"log"
@@ -19,15 +18,15 @@ func InitDB() (*gorm.DB, error) {
 	log.Println("Running database migrations...")
 
 	// 自动建表
-	err = db.AutoMigrate(
-		&model.Campaign{},
-		&model.WorkflowTask{},
-		&model.DeliveryMetric{},
-		&model.Settlement{},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to migrate database: %w", err)
-	}
+	//err = db.AutoMigrate(
+	//	&models.Campaign{},
+	//	&models.WorkflowTask{},
+	//	&models.DeliveryMetric{},
+	//	&models.Settlement{},
+	//)
+	//if err != nil {
+	//	return nil, fmt.Errorf("failed to migrate database: %w", err)
+	//}
 
 	log.Println("Database ready.")
 	return db, nil

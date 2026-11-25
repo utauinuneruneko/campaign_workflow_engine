@@ -1,13 +1,13 @@
-package worker
+package service
 
 import (
 	"errors"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal"
+	"github.com/utauinuneruneko/campaign_workflow_engine/models"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/clock"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -44,24 +44,24 @@ func TestCalculateNextWorkflowBudget(t *testing.T) {
 	}
 }
 
-func setupWorkerTest(t *testing.T, now time.Time) (*Worker, *clock.FakeClock, *gorm.DB) {
+func setupWorkerTest(t *testing.T, now time.Time) (*Worker, *internal.FakeClock, *gorm.DB) {
 	t.Helper()
 	database, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "worker.db")), &gorm.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := database.AutoMigrate(&model.Campaign{}, &model.WorkflowTask{}); err != nil {
+	if err := database.AutoMigrate(&models.Campaign{}, &models.WorkflowTask{}); err != nil {
 		t.Fatal(err)
 	}
-	fake := clock.NewFakeClock(now)
+	fake := internal.NewFakeClock(now)
 	return NewWorker(database, fake), fake, database
 }
 
-func insertApprovedCampaign(t *testing.T, db *gorm.DB, approvedAt, start, end time.Time) model.Campaign {
+func insertApprovedCampaign(t *testing.T, db *gorm.DB, approvedAt, start, end time.Time) models.Campaign {
 	t.Helper()
-	campaign := model.Campaign{
+	campaign := models.Campaign{
 		Name: "clock test", StartTime: start, EndTime: end,
-		Status: model.CampaignStatusApproved, ApprovedAt: &approvedAt,
+		Status: models.CampaignStatusApproved, ApprovedAt: &approvedAt,
 		Budget: 1_500_000,
 	}
 	if err := db.Create(&campaign).Error; err != nil {
@@ -78,7 +78,7 @@ func TestApprovedCampaignBeforeStartDoesNotCreateWorkflow(t *testing.T) {
 		t.Fatalf("RunOnce err=%v, want no pending task", err)
 	}
 	var count int64
-	if err := db.Model(&model.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count).Error; err != nil {
+	if err := db.Model(&models.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count).Error; err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
@@ -98,11 +98,11 @@ func TestCampaignCreatesFirstWorkflowWhenFakeTimeReachesStart(t *testing.T) {
 	if err := w.RunOnce(); err != nil {
 		t.Fatalf("at start RunOnce: %v", err)
 	}
-	var task model.WorkflowTask
+	var task models.WorkflowTask
 	if err := db.Where("campaign_id = ?", campaign.ID).First(&task).Error; err != nil {
 		t.Fatal(err)
 	}
-	if task.Status != model.WorkflowTaskStatusRunning {
+	if task.Status != models.WorkflowTaskStatusRunning {
 		t.Fatalf("task status=%v, want RUNNING", task.Status)
 	}
 	if !task.StartTime.Equal(start) || !task.EndTime.Equal(start.Add(8*24*time.Hour)) {
@@ -121,7 +121,7 @@ func TestNextWorkflowWaitsForPreviousTerminalState(t *testing.T) {
 	if err := w.RunOnce(); err != nil {
 		t.Fatal(err)
 	}
-	var first model.WorkflowTask
+	var first models.WorkflowTask
 	if err := db.Where("campaign_id = ?", campaign.ID).First(&first).Error; err != nil {
 		t.Fatal(err)
 	}
@@ -129,12 +129,12 @@ func TestNextWorkflowWaitsForPreviousTerminalState(t *testing.T) {
 		t.Fatalf("second RunOnce while first runs = %v, want no task", err)
 	}
 	var count int64
-	db.Model(&model.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count)
+	db.Model(&models.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count)
 	if count != 1 {
 		t.Fatalf("tasks=%d before first terminal, want 1", count)
 	}
 
-	if err := db.Model(&model.WorkflowTask{}).Where("id = ?", first.ID).Update("status", model.WorkflowTaskStatusSuccess).Error; err != nil {
+	if err := db.Model(&models.WorkflowTask{}).Where("id = ?", first.ID).Update("status", models.WorkflowTaskStatusSuccess).Error; err != nil {
 		t.Fatal(err)
 	}
 	fake.Set(first.EndTime.Add(-time.Nanosecond))
@@ -145,15 +145,15 @@ func TestNextWorkflowWaitsForPreviousTerminalState(t *testing.T) {
 	if err := w.RunOnce(); err != nil {
 		t.Fatalf("at next start RunOnce: %v", err)
 	}
-	db.Model(&model.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count)
+	db.Model(&models.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count)
 	if count != 2 {
 		t.Fatalf("tasks=%d after first terminal and next start, want 2", count)
 	}
-	var second model.WorkflowTask
+	var second models.WorkflowTask
 	if err := db.Where("campaign_id = ?", campaign.ID).Order("id DESC").First(&second).Error; err != nil {
 		t.Fatal(err)
 	}
-	if second.Status != model.WorkflowTaskStatusRunning {
+	if second.Status != models.WorkflowTaskStatusRunning {
 		t.Fatalf("second status=%v, want RUNNING", second.Status)
 	}
 }
@@ -170,11 +170,11 @@ func TestCampaignCompletesAfterEndTime(t *testing.T) {
 	if err := w.RunOnce(); !errors.Is(err, ErrNoPendingTask) {
 		t.Fatalf("RunOnce at end=%v, want no task", err)
 	}
-	var got model.Campaign
+	var got models.Campaign
 	if err := db.First(&got, campaign.ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != model.CampaignStatusCompleted {
+	if got.Status != models.CampaignStatusCompleted {
 		t.Fatalf("campaign status=%v, want COMPLETED", got.Status)
 	}
 }

@@ -2,25 +2,24 @@ package handler
 
 import (
 	"errors"
-	"net/http"
-
 	"github.com/gin-gonic/gin"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/clock"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/worker"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal"
+	"github.com/utauinuneruneko/campaign_workflow_engine/service"
 	"gorm.io/gorm"
+	"net/http"
 )
 
 type WorkerHandler struct {
-	worker *worker.Worker
+	worker *service.Worker
 }
 
 func NewWorkerHandler(db *gorm.DB) *WorkerHandler {
-	return &WorkerHandler{worker: worker.NewWorker(db, clock.RealClock{})}
+	return &WorkerHandler{worker: service.NewWorker(db, internal.RealClock{})}
 }
 
 func (h *WorkerHandler) RunOnce(c *gin.Context) {
 	err := h.worker.RunOnce()
-	if errors.Is(err, worker.ErrNoPendingTask) {
+	if errors.Is(err, service.ErrNoPendingTask) {
 		c.Status(http.StatusNoContent)
 		return
 	}
