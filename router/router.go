@@ -2,7 +2,7 @@ package router
 
 import (
 	"github.com/gin-gonic/gin"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/handler"
+	"github.com/utauinuneruneko/campaign_workflow_engine/handler"
 	"gorm.io/gorm"
 )
 

@@ -3,13 +3,12 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/utauinuneruneko/campaign_workflow_engine/models"
+	"gorm.io/gorm"
 	"net/http"
 	"strconv"
 	"time"
-
-	"github.com/gin-gonic/gin"
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
-	"gorm.io/gorm"
 )
 
 type workflowDeliveryRequest struct {
@@ -35,7 +34,7 @@ func (h *WorkerHandler) WorkflowDelivery(c *gin.Context) {
 		return
 	}
 
-	var updated model.WorkflowTask
+	var updated models.WorkflowTask
 	err := h.worker.GetDB().Transaction(func(tx *gorm.DB) error {
 		return h.recordDelivery(tx, workflowID, req.Amount, &updated)
 	})
@@ -55,7 +54,7 @@ func (h *WorkerHandler) recordDelivery(
 	tx *gorm.DB,
 	workflowID int64,
 	amount int64,
-	updated *model.WorkflowTask,
+	updated *models.WorkflowTask,
 ) error {
 	task, campaign, err := h.loadDeliveryEntities(tx, workflowID)
 	if err != nil {
@@ -76,25 +75,25 @@ func (h *WorkerHandler) recordDelivery(
 func (h *WorkerHandler) loadDeliveryEntities(
 	tx *gorm.DB,
 	workflowID int64,
-) (model.WorkflowTask, model.Campaign, error) {
-	var task model.WorkflowTask
+) (models.WorkflowTask, models.Campaign, error) {
+	var task models.WorkflowTask
 	if err := tx.First(&task, workflowID).Error; err != nil {
-		return model.WorkflowTask{}, model.Campaign{}, err
+		return models.WorkflowTask{}, models.Campaign{}, err
 	}
 
-	var campaign model.Campaign
+	var campaign models.Campaign
 	if err := tx.First(&campaign, task.CampaignID).Error; err != nil {
-		return model.WorkflowTask{}, model.Campaign{}, err
+		return models.WorkflowTask{}, models.Campaign{}, err
 	}
 	return task, campaign, nil
 }
 
 func validateDelivery(
-	task model.WorkflowTask,
-	campaign model.Campaign,
+	task models.WorkflowTask,
+	campaign models.Campaign,
 	amount int64,
 ) error {
-	if task.Status != model.WorkflowTaskStatusRunning {
+	if task.Status != models.WorkflowTaskStatusRunning {
 		return errWorkflowNotRunning
 	}
 	if amount > task.Budget-task.SpentBudget {
@@ -102,7 +101,7 @@ func validateDelivery(
 	}
 
 	now := time.Now()
-	if campaign.Status != model.CampaignStatusDelivering ||
+	if campaign.Status != models.CampaignStatusDelivering ||
 		!campaign.EndTime.After(now) ||
 		!task.EndTime.After(now) {
 		return errWorkflowDeliveryClosed
@@ -115,21 +114,21 @@ func validateDelivery(
 
 func recordWorkflowSpend(
 	tx *gorm.DB,
-	task model.WorkflowTask,
+	task models.WorkflowTask,
 	amount int64,
 ) error {
 	updates := map[string]interface{}{
 		"spent_budget": gorm.Expr("spent_budget + ?", amount),
 	}
 	if task.SpentBudget+amount >= task.Budget {
-		updates["status"] = model.WorkflowTaskStatusSuccess
+		updates["status"] = models.WorkflowTaskStatusSuccess
 	}
 
-	result := tx.Model(&model.WorkflowTask{}).
+	result := tx.Model(&models.WorkflowTask{}).
 		Where(
 			"id = ? AND status = ? AND spent_budget + ? <= budget",
 			task.ID,
-			model.WorkflowTaskStatusRunning,
+			models.WorkflowTaskStatusRunning,
 			amount,
 		).
 		Updates(updates)
@@ -144,16 +143,16 @@ func recordWorkflowSpend(
 
 func recordCampaignSpend(
 	tx *gorm.DB,
-	campaign model.Campaign,
+	campaign models.Campaign,
 	amount int64,
 ) error {
 	now := time.Now()
-	result := tx.Model(&model.Campaign{}).
+	result := tx.Model(&models.Campaign{}).
 		Where(
 			"id = ? AND status = ? AND end_time > ? "+
 				"AND spent_budget + ? <= budget",
 			campaign.ID,
-			model.CampaignStatusDelivering,
+			models.CampaignStatusDelivering,
 			now,
 			amount,
 		).
@@ -170,7 +169,7 @@ func recordCampaignSpend(
 func (h *WorkerHandler) respondWorkflowDelivery(
 	c *gin.Context,
 	err error,
-	updated model.WorkflowTask,
+	updated models.WorkflowTask,
 ) {
 	switch {
 	case err == nil:

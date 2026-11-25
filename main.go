@@ -1,21 +1,36 @@
 package main
 
 import (
-  "fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/utauinuneruneko/campaign_workflow_engine/internal"
+	"github.com/utauinuneruneko/campaign_workflow_engine/router"
+	"log"
+	"net/http"
 )
 
-//TIP <p>To run your code, right-click the code and select <b>Run</b>.</p> <p>Alternatively, click
-// the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.</p>
-
 func main() {
-  //TIP <p>Press <shortcut actionId="ShowIntentionActions"/> when your caret is at the underlined text
-  // to see how GoLand suggests fixing the warning.</p><p>Alternatively, if available, click the lightbulb to view possible fixes.</p>
-  s := "gopher"
-  fmt.Println("Hello and welcome, %s!", s)
+	// 1. 初始化数据库
+	database, err := internal.InitDB()
+	if err != nil {
+		log.Fatalf("Database initialization failed: %v", err)
+	}
 
-  for i := 1; i <= 5; i++ {
-	//TIP <p>To start your debugging session, right-click your code in the editor and select the Debug option.</p> <p>We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint
-	// for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.</p>
-	fmt.Println("i =", 100/i)
-  }
+	// 2. 设置 Gin 路由
+	r := gin.Default()
+
+	// 健康检查接口
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "ok",
+			"service": "campaign_workflow_engine",
+		})
+	})
+
+	router.RegisterRoutes(r, database)
+
+	// 3. 启动
+	log.Println("Server is running on http://localhost:8080")
+	if err := r.Run(":8080"); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
+	}
 }

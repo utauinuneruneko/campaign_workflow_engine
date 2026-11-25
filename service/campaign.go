@@ -4,10 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
-
-	"github.com/utauinuneruneko/campaign_workflow_engine/internal/model"
+	"github.com/utauinuneruneko/campaign_workflow_engine/models"
 	"gorm.io/gorm"
+	"time"
 )
 
 const SubmissionExpiry = 48 * time.Hour
@@ -28,9 +27,9 @@ func NewCampaignService(db *gorm.DB) *CampaignService { return &CampaignService{
 
 func (s *CampaignService) Submit(ctx context.Context, campaignID int64) error {
 	now := s.now()
-	result := s.db.WithContext(ctx).Model(&model.Campaign{}).
-		Where("id = ? AND status = ?", campaignID, model.CampaignStatusDraft).
-		Updates(map[string]interface{}{"status": model.CampaignStatusSubmitted, "submitted_at": now})
+	result := s.db.WithContext(ctx).Model(&models.Campaign{}).
+		Where("id = ? AND status = ?", campaignID, models.CampaignStatusDraft).
+		Updates(map[string]interface{}{"status": models.CampaignStatusSubmitted, "submitted_at": now})
 	if result.Error != nil {
 		return fmt.Errorf("submit campaign: %w", result.Error)
 	}
@@ -43,14 +42,14 @@ func (s *CampaignService) Submit(ctx context.Context, campaignID int64) error {
 func (s *CampaignService) Approve(ctx context.Context, campaignID int64) error {
 	expired := false
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var campaign model.Campaign
+		var campaign models.Campaign
 		if err := tx.First(&campaign, campaignID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrCampaignNotFound
 			}
 			return err
 		}
-		if campaign.Status != model.CampaignStatusSubmitted {
+		if campaign.Status != models.CampaignStatusSubmitted {
 			return ErrInvalidTransition
 		}
 		now := s.now()
@@ -60,14 +59,14 @@ func (s *CampaignService) Approve(ctx context.Context, campaignID int64) error {
 		}
 		if now.Sub(*submittedAt) > SubmissionExpiry {
 			expired = true
-			return tx.Model(&model.Campaign{}).Where("id = ? AND status = ?", campaign.ID, model.CampaignStatusSubmitted).
-				Updates(map[string]interface{}{"status": model.CampaignStatusDraft, "submitted_at": nil}).Error
+			return tx.Model(&models.Campaign{}).Where("id = ? AND status = ?", campaign.ID, models.CampaignStatusSubmitted).
+				Updates(map[string]interface{}{"status": models.CampaignStatusDraft, "submitted_at": nil}).Error
 		}
 		if campaign.Budget <= 0 {
 			return errors.New("campaign budget must be positive")
 		}
-		result := tx.Model(&model.Campaign{}).Where("id = ? AND status = ?", campaign.ID, model.CampaignStatusSubmitted).
-			Updates(map[string]interface{}{"status": model.CampaignStatusApproved, "approved_at": now})
+		result := tx.Model(&models.Campaign{}).Where("id = ? AND status = ?", campaign.ID, models.CampaignStatusSubmitted).
+			Updates(map[string]interface{}{"status": models.CampaignStatusApproved, "approved_at": now})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -90,14 +89,14 @@ func (s *CampaignService) Approve(ctx context.Context, campaignID int64) error {
 
 func (s *CampaignService) CreateInitialTaskIfDue(ctx context.Context, campaignID int64) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var campaign model.Campaign
+		var campaign models.Campaign
 		if err := tx.First(&campaign, campaignID).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrCampaignNotFound
 			}
 			return err
 		}
-		if campaign.Status != model.CampaignStatusApproved {
+		if campaign.Status != models.CampaignStatusApproved {
 			return ErrInvalidTransition
 		}
 		now := s.now()
@@ -108,17 +107,17 @@ func (s *CampaignService) CreateInitialTaskIfDue(ctx context.Context, campaignID
 	})
 }
 
-func createInitialTask(tx *gorm.DB, campaign model.Campaign) error {
+func createInitialTask(tx *gorm.DB, campaign models.Campaign) error {
 	var count int64
-	if err := tx.Model(&model.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count).Error; err != nil {
+	if err := tx.Model(&models.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count).Error; err != nil {
 		return err
 	}
 	if count != 0 {
 		return nil
 	}
-	return tx.Create(&model.WorkflowTask{
+	return tx.Create(&models.WorkflowTask{
 		CampaignID:     campaign.ID,
-		Status:         model.WorkflowTaskStatusPending,
+		Status:         models.WorkflowTaskStatusPending,
 		StartTime:      campaign.StartTime,
 		EndTime:        campaign.EndTime,
 		Budget:         campaign.Budget,
@@ -128,14 +127,14 @@ func createInitialTask(tx *gorm.DB, campaign model.Campaign) error {
 
 func (s *CampaignService) ExpireSubmissions(ctx context.Context) (int64, error) {
 	cutoff := s.now().Add(-SubmissionExpiry)
-	result := s.db.WithContext(ctx).Model(&model.Campaign{}).
-		Where("status = ? AND COALESCE(submitted_at, modify_time) < ?", model.CampaignStatusSubmitted, cutoff).
-		Updates(map[string]interface{}{"status": model.CampaignStatusDraft, "submitted_at": nil})
+	result := s.db.WithContext(ctx).Model(&models.Campaign{}).
+		Where("status = ? AND COALESCE(submitted_at, modify_time) < ?", models.CampaignStatusSubmitted, cutoff).
+		Updates(map[string]interface{}{"status": models.CampaignStatusDraft, "submitted_at": nil})
 	return result.RowsAffected, result.Error
 }
 
 func (s *CampaignService) transitionError(ctx context.Context, campaignID int64) error {
-	var campaign model.Campaign
+	var campaign models.Campaign
 	err := s.db.WithContext(ctx).Select("id").First(&campaign, campaignID).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return ErrCampaignNotFound
