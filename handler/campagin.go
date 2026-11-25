@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/utauinuneruneko/campaign_workflow_engine/models"
+	"github.com/utauinuneruneko/campaign_workflow_engine/repo"
 	"gorm.io/gorm"
 	"net/http"
 	"strconv"
@@ -57,9 +58,7 @@ func (h *CampaignHandler) CreateCampaign(c *gin.Context) {
 	req.Name = strings.TrimSpace(req.Name)
 	req.AdvertiserID = strings.TrimSpace(req.AdvertiserID)
 	if req.Name == "" || req.AdvertiserID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "name and advertiser_id must not be blank",
-		})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name and advertiser_id must not be blank"})
 		return
 	}
 
@@ -71,7 +70,7 @@ func (h *CampaignHandler) CreateCampaign(c *gin.Context) {
 		StartTime:    req.StartTime,
 		EndTime:      req.EndTime,
 	}
-	if err := h.db.Create(&campaign).Error; err != nil {
+	if err := repo.NewCampaignRepository(h.db).Create(&campaign); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -79,11 +78,9 @@ func (h *CampaignHandler) CreateCampaign(c *gin.Context) {
 }
 
 func (h *CampaignHandler) ListCampaigns(c *gin.Context) {
-	var campaigns []models.Campaign
-	if err := h.db.Find(&campaigns).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "failed to list campaigns",
-		})
+	campaigns, err := repo.NewCampaignRepository(h.db).List()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list campaigns"})
 		return
 	}
 	c.JSON(http.StatusOK, campaigns)
@@ -100,15 +97,11 @@ func (h *CampaignHandler) GetCampaignByID(c *gin.Context) {
 		h.respondCampaignLookupError(c, err)
 		return
 	}
-
 	workflows, err := h.findCampaignWorkflows(campaign.ID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "failed to fetch campaign workflows",
-		})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch campaign workflows"})
 		return
 	}
-
 	c.JSON(http.StatusOK, campaignDetailResponse{
 		Campaign:      campaign,
 		WorkflowTasks: workflows,
@@ -116,11 +109,7 @@ func (h *CampaignHandler) GetCampaignByID(c *gin.Context) {
 }
 
 func (h *CampaignHandler) findCampaign(id int64) (models.Campaign, error) {
-	var campaign models.Campaign
-	if err := h.db.First(&campaign, id).Error; err != nil {
-		return models.Campaign{}, err
-	}
-	return campaign, nil
+	return repo.NewCampaignRepository(h.db).GetByID(id)
 }
 
 func (h *CampaignHandler) findCampaignWorkflows(
@@ -141,17 +130,11 @@ func (h *CampaignHandler) respondCampaignLookupError(c *gin.Context, err error) 
 		c.JSON(http.StatusNotFound, gin.H{"error": "campaign not found"})
 		return
 	}
-	c.JSON(http.StatusInternalServerError, gin.H{
-		"error": "failed to fetch campaign",
-	})
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch campaign"})
 }
 
 func (h *CampaignHandler) SubmitCampaign(c *gin.Context) {
-	h.transitionCampaign(
-		c,
-		models.CampaignStatusDraft,
-		models.CampaignStatusSubmitted,
-	)
+	h.transitionCampaign(c, models.CampaignStatusDraft, models.CampaignStatusSubmitted)
 }
 
 func (h *CampaignHandler) ApproveCampaign(c *gin.Context) {
@@ -162,7 +145,7 @@ func (h *CampaignHandler) ApproveCampaign(c *gin.Context) {
 
 	now := time.Now()
 	err := h.db.Transaction(func(tx *gorm.DB) error {
-		campaign, err := h.loadCampaignForTransition(tx, id)
+		campaign, err := repo.NewCampaignRepository(tx).GetByID(id)
 		if err != nil {
 			return err
 		}
@@ -177,21 +160,10 @@ func (h *CampaignHandler) ApproveCampaign(c *gin.Context) {
 	h.respondCampaignMutation(c, err, "campaign approved")
 }
 
-func (h *CampaignHandler) loadCampaignForTransition(
-	tx *gorm.DB,
-	id int64,
-) (models.Campaign, error) {
-	var campaign models.Campaign
-	if err := tx.First(&campaign, id).Error; err != nil {
-		return models.Campaign{}, err
-	}
-	if campaign.Status != models.CampaignStatusSubmitted {
-		return models.Campaign{}, errInvalidCampaignTransition
-	}
-	return campaign, nil
-}
-
 func validateApproval(campaign models.Campaign) error {
+	if campaign.Status != models.CampaignStatusSubmitted {
+		return errInvalidCampaignTransition
+	}
 	if campaign.Budget <= 0 {
 		return errCampaignBudgetRequired
 	}
@@ -206,19 +178,11 @@ func (h *CampaignHandler) approveCampaign(
 	campaign models.Campaign,
 	now time.Time,
 ) error {
-	result := tx.Model(&models.Campaign{}).
-		Where("id = ? AND status = ?", campaign.ID, models.CampaignStatusSubmitted).
-		Updates(map[string]interface{}{
-			"status":      models.CampaignStatusApproved,
-			"approved_at": now,
-		})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return errInvalidCampaignTransition
-	}
-	return nil
+	_, err := repo.NewCampaignRepository(tx).UpdateByID(campaign.ID, map[string]interface{}{
+		"status":      models.CampaignStatusApproved,
+		"approved_at": now,
+	})
+	return err
 }
 
 func (h *CampaignHandler) createInitialWorkflowIfDue(
@@ -256,25 +220,19 @@ func (h *CampaignHandler) CancelCampaign(c *gin.Context) {
 	if !ok {
 		return
 	}
-
-	result := h.db.Model(&models.Campaign{}).
-		Where(
-			"id = ? AND status IN ?",
-			id,
-			[]models.CampaignStatus{
-				models.CampaignStatusDraft,
-				models.CampaignStatusSubmitted,
-			},
-		).
-		Update("status", models.CampaignStatusCancelled)
-	if result.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "failed to cancel campaign",
-		})
+	campaign, err := repo.NewCampaignRepository(h.db).GetByID(id)
+	if err != nil {
+		h.respondCampaignLookupError(c, err)
 		return
 	}
-	if result.RowsAffected == 0 {
-		h.respondTransitionNotApplied(c, id)
+	if campaign.Status != models.CampaignStatusDraft && campaign.Status != models.CampaignStatusSubmitted {
+		h.respondInvalidTransition(c)
+		return
+	}
+	if _, err := repo.NewCampaignRepository(h.db).UpdateByID(id, map[string]interface{}{
+		"status": models.CampaignStatusCancelled,
+	}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to cancel campaign"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "campaign cancelled"})
@@ -289,41 +247,28 @@ func (h *CampaignHandler) transitionCampaign(
 	if !ok {
 		return
 	}
+	campaign, err := repo.NewCampaignRepository(h.db).GetByID(id)
+	if err != nil {
+		h.respondCampaignLookupError(c, err)
+		return
+	}
+	if campaign.Status != from {
+		h.respondInvalidTransition(c)
+		return
+	}
 
 	updates := map[string]interface{}{"status": to}
 	if to == models.CampaignStatusSubmitted {
 		updates["submitted_at"] = time.Now()
 	}
-	result := h.db.Model(&models.Campaign{}).
-		Where("id = ? AND status = ?", id, from).
-		Updates(updates)
-	if result.Error != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "failed to update campaign status",
-		})
-		return
-	}
-	if result.RowsAffected == 0 {
-		h.respondTransitionNotApplied(c, id)
+	if _, err := repo.NewCampaignRepository(h.db).UpdateByID(id, updates); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update campaign status"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "campaign status updated"})
 }
 
-func (h *CampaignHandler) respondTransitionNotApplied(c *gin.Context, id int64) {
-	var count int64
-	if err := h.db.Model(&models.Campaign{}).
-		Where("id = ?", id).
-		Count(&count).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "failed to find campaign",
-		})
-		return
-	}
-	if count == 0 {
-		c.JSON(http.StatusNotFound, gin.H{"error": "campaign not found"})
-		return
-	}
+func (h *CampaignHandler) respondInvalidTransition(c *gin.Context) {
 	c.JSON(http.StatusConflict, gin.H{
 		"error": "campaign cannot make the requested status transition",
 	})
@@ -340,16 +285,12 @@ func (h *CampaignHandler) respondCampaignMutation(
 	case errors.Is(err, gorm.ErrRecordNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": "campaign not found"})
 	case errors.Is(err, errInvalidCampaignTransition):
-		c.JSON(http.StatusConflict, gin.H{
-			"error": "campaign cannot make the requested status transition",
-		})
+		h.respondInvalidTransition(c)
 	case errors.Is(err, errCampaignBudgetRequired),
 		errors.Is(err, errCampaignTermTooShort):
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 	default:
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "failed to update campaign",
-		})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update campaign"})
 	}
 }
 

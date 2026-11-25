@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/utauinuneruneko/campaign_workflow_engine/models"
-	"gorm.io/gorm"
 	"time"
+
+	"github.com/utauinuneruneko/campaign_workflow_engine/models"
+	"github.com/utauinuneruneko/campaign_workflow_engine/repo"
+	"gorm.io/gorm"
 )
 
 const SubmissionExpiry = 48 * time.Hour
@@ -19,64 +21,73 @@ var (
 )
 
 type CampaignService struct {
-	db  *gorm.DB
-	now func() time.Time
+	db   *gorm.DB
+	now  func() time.Time
+	repo *repo.CampaignRepository
 }
 
-func NewCampaignService(db *gorm.DB) *CampaignService { return &CampaignService{db: db, now: time.Now} }
+func NewCampaignService(db *gorm.DB) *CampaignService {
+	return &CampaignService{
+		db:   db,
+		now:  time.Now,
+		repo: repo.NewCampaignRepository(db),
+	}
+}
 
 func (s *CampaignService) Submit(ctx context.Context, campaignID int64) error {
 	now := s.now()
-	result := s.db.WithContext(ctx).Model(&models.Campaign{}).
-		Where("id = ? AND status = ?", campaignID, models.CampaignStatusDraft).
-		Updates(map[string]interface{}{"status": models.CampaignStatusSubmitted, "submitted_at": now})
-	if result.Error != nil {
-		return fmt.Errorf("submit campaign: %w", result.Error)
-	}
-	if result.RowsAffected == 0 {
-		return s.transitionError(ctx, campaignID)
-	}
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		campaignRepo := s.repo.WithDB(tx)
+		campaign, err := campaignRepo.GetByID(campaignID)
+		if err != nil {
+			return s.mapCampaignLookupError(err)
+		}
+		if campaign.Status != models.CampaignStatusDraft {
+			return ErrInvalidTransition
+		}
+
+		_, err = campaignRepo.UpdateByID(campaignID, map[string]interface{}{
+			"status":       models.CampaignStatusSubmitted,
+			"submitted_at": now,
+		})
+		return err
+	})
 }
 
 func (s *CampaignService) Approve(ctx context.Context, campaignID int64) error {
 	expired := false
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var campaign models.Campaign
-		if err := tx.First(&campaign, campaignID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrCampaignNotFound
-			}
-			return err
+		campaignRepo := s.repo.WithDB(tx)
+		campaign, err := campaignRepo.GetByID(campaignID)
+		if err != nil {
+			return s.mapCampaignLookupError(err)
 		}
 		if campaign.Status != models.CampaignStatusSubmitted {
 			return ErrInvalidTransition
 		}
+
 		now := s.now()
-		submittedAt := campaign.SubmittedAt
-		if submittedAt == nil {
-			submittedAt = &campaign.ModifyTime
-		}
-		if now.Sub(*submittedAt) > SubmissionExpiry {
+		if s.submissionExpired(campaign, now) {
 			expired = true
-			return tx.Model(&models.Campaign{}).Where("id = ? AND status = ?", campaign.ID, models.CampaignStatusSubmitted).
-				Updates(map[string]interface{}{"status": models.CampaignStatusDraft, "submitted_at": nil}).Error
+			_, err := campaignRepo.UpdateByID(campaign.ID, map[string]interface{}{
+				"status":       models.CampaignStatusDraft,
+				"submitted_at": nil,
+			})
+			return err
 		}
 		if campaign.Budget <= 0 {
 			return errors.New("campaign budget must be positive")
 		}
-		result := tx.Model(&models.Campaign{}).Where("id = ? AND status = ?", campaign.ID, models.CampaignStatusSubmitted).
-			Updates(map[string]interface{}{"status": models.CampaignStatusApproved, "approved_at": now})
-		if result.Error != nil {
-			return result.Error
+		if _, err := campaignRepo.UpdateByID(campaign.ID, map[string]interface{}{
+			"status":      models.CampaignStatusApproved,
+			"approved_at": now,
+		}); err != nil {
+			return err
 		}
-		if result.RowsAffected == 0 {
-			return ErrInvalidTransition
+		if now.Before(campaign.StartTime) {
+			return nil
 		}
-		if !now.Before(campaign.StartTime) {
-			return createInitialTask(tx, campaign)
-		}
-		return nil
+		return createInitialTask(tx, campaign)
 	})
 	if err != nil {
 		return err
@@ -89,18 +100,14 @@ func (s *CampaignService) Approve(ctx context.Context, campaignID int64) error {
 
 func (s *CampaignService) CreateInitialTaskIfDue(ctx context.Context, campaignID int64) error {
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var campaign models.Campaign
-		if err := tx.First(&campaign, campaignID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return ErrCampaignNotFound
-			}
-			return err
+		campaign, err := s.repo.WithDB(tx).GetByID(campaignID)
+		if err != nil {
+			return s.mapCampaignLookupError(err)
 		}
 		if campaign.Status != models.CampaignStatusApproved {
 			return ErrInvalidTransition
 		}
-		now := s.now()
-		if now.Before(campaign.StartTime) {
+		if s.now().Before(campaign.StartTime) {
 			return ErrCampaignNotStarted
 		}
 		return createInitialTask(tx, campaign)
@@ -109,38 +116,68 @@ func (s *CampaignService) CreateInitialTaskIfDue(ctx context.Context, campaignID
 
 func createInitialTask(tx *gorm.DB, campaign models.Campaign) error {
 	var count int64
-	if err := tx.Model(&models.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count).Error; err != nil {
+	if err := tx.Model(&models.WorkflowTask{}).
+		Where("campaign_id = ?", campaign.ID).
+		Count(&count).Error; err != nil {
 		return err
 	}
 	if count != 0 {
 		return nil
 	}
-	return tx.Create(&models.WorkflowTask{
+	workflow := models.WorkflowTask{
 		CampaignID:     campaign.ID,
 		Status:         models.WorkflowTaskStatusPending,
 		StartTime:      campaign.StartTime,
 		EndTime:        campaign.EndTime,
 		Budget:         campaign.Budget,
 		IdempotencyKey: fmt.Sprintf("campaign-%d-initial-workflow", campaign.ID),
-	}).Error
+	}
+	return tx.Create(&workflow).Error
 }
 
 func (s *CampaignService) ExpireSubmissions(ctx context.Context) (int64, error) {
+	campaigns, err := s.repo.List()
+	if err != nil {
+		return 0, err
+	}
+
 	cutoff := s.now().Add(-SubmissionExpiry)
-	result := s.db.WithContext(ctx).Model(&models.Campaign{}).
-		Where("status = ? AND COALESCE(submitted_at, modify_time) < ?", models.CampaignStatusSubmitted, cutoff).
-		Updates(map[string]interface{}{"status": models.CampaignStatusDraft, "submitted_at": nil})
-	return result.RowsAffected, result.Error
+	var expired int64
+	for _, campaign := range campaigns {
+		if campaign.Status != models.CampaignStatusSubmitted ||
+			!s.submissionExpired(campaign, cutoff.Add(SubmissionExpiry)) {
+			continue
+		}
+		if _, err := s.repo.UpdateByID(campaign.ID, map[string]interface{}{
+			"status":       models.CampaignStatusDraft,
+			"submitted_at": nil,
+		}); err != nil {
+			return expired, err
+		}
+		expired++
+	}
+	return expired, nil
+}
+
+func (s *CampaignService) submissionExpired(campaign models.Campaign, now time.Time) bool {
+	submittedAt := campaign.SubmittedAt
+	if submittedAt == nil {
+		submittedAt = &campaign.ModifyTime
+	}
+	return now.Sub(*submittedAt) > SubmissionExpiry
 }
 
 func (s *CampaignService) transitionError(ctx context.Context, campaignID int64) error {
-	var campaign models.Campaign
-	err := s.db.WithContext(ctx).Select("id").First(&campaign, campaignID).Error
+	_, err := s.repo.GetByID(campaignID)
+	return s.mapCampaignLookupError(err)
+}
+
+func (s *CampaignService) mapCampaignLookupError(err error) error {
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return ErrCampaignNotFound
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("load campaign: %w", err)
 	}
 	return ErrInvalidTransition
 }
