@@ -3,14 +3,16 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/utauinuneruneko/campaign_workflow_engine/models"
 	"github.com/utauinuneruneko/campaign_workflow_engine/repo"
 	"gorm.io/gorm"
-	"net/http"
-	"strconv"
-	"strings"
-	"time"
 )
 
 var (
@@ -115,14 +117,30 @@ func (h *CampaignHandler) findCampaign(id int64) (models.Campaign, error) {
 func (h *CampaignHandler) findCampaignWorkflows(
 	campaignID int64,
 ) ([]campaignWorkflowSummary, error) {
-	var workflows []campaignWorkflowSummary
-	err := h.db.Model(&models.WorkflowTask{}).
-		Select("id, status, start_time, end_time, budget").
-		Where("campaign_id = ?", campaignID).
-		Order("start_time ASC").
-		Order("id ASC").
-		Scan(&workflows).Error
-	return workflows, err
+	tasks, err := repo.NewWorkflowRepository(h.db).List()
+	if err != nil {
+		return nil, err
+	}
+	workflows := make([]campaignWorkflowSummary, 0)
+	for _, task := range tasks {
+		if task.CampaignID != campaignID {
+			continue
+		}
+		workflows = append(workflows, campaignWorkflowSummary{
+			ID:        task.ID,
+			Status:    task.Status,
+			StartTime: task.StartTime,
+			EndTime:   task.EndTime,
+			Budget:    task.Budget,
+		})
+	}
+	sort.Slice(workflows, func(i, j int) bool {
+		if workflows[i].StartTime.Equal(workflows[j].StartTime) {
+			return workflows[i].ID < workflows[j].ID
+		}
+		return workflows[i].StartTime.Before(workflows[j].StartTime)
+	})
+	return workflows, nil
 }
 
 func (h *CampaignHandler) respondCampaignLookupError(c *gin.Context, err error) {
@@ -194,14 +212,14 @@ func (h *CampaignHandler) createInitialWorkflowIfDue(
 		return nil
 	}
 
-	var count int64
-	if err := tx.Model(&models.WorkflowTask{}).
-		Where("campaign_id = ?", campaign.ID).
-		Count(&count).Error; err != nil {
+	tasks, err := repo.NewWorkflowRepository(tx).List()
+	if err != nil {
 		return err
 	}
-	if count != 0 {
-		return nil
+	for _, task := range tasks {
+		if task.CampaignID == campaign.ID {
+			return nil
+		}
 	}
 
 	workflow := models.WorkflowTask{
@@ -212,7 +230,7 @@ func (h *CampaignHandler) createInitialWorkflowIfDue(
 		EndTime:        campaign.EndTime,
 		IdempotencyKey: fmt.Sprintf("campaign-%d-initial-workflow", campaign.ID),
 	}
-	return tx.Create(&workflow).Error
+	return repo.NewWorkflowRepository(tx).Create(&workflow)
 }
 
 func (h *CampaignHandler) CancelCampaign(c *gin.Context) {

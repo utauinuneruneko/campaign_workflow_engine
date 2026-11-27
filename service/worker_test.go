@@ -74,7 +74,7 @@ func TestApprovedCampaignBeforeStartDoesNotCreateWorkflow(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	w, _, db := setupWorkerTest(t, now)
 	campaign := insertApprovedCampaign(t, db, now, now.Add(time.Hour), now.Add(16*24*time.Hour))
-	if err := w.RunOnce(); !errors.Is(err, ErrNoPendingTask) {
+	if err := w.RunOnce(campaign.ID); !errors.Is(err, ErrNoPendingTask) {
 		t.Fatalf("RunOnce err=%v, want no pending task", err)
 	}
 	var count int64
@@ -91,11 +91,11 @@ func TestCampaignCreatesFirstWorkflowWhenFakeTimeReachesStart(t *testing.T) {
 	w, fake, db := setupWorkerTest(t, now)
 	start := now.Add(time.Hour)
 	campaign := insertApprovedCampaign(t, db, now, start, start.Add(15*24*time.Hour))
-	if err := w.RunOnce(); !errors.Is(err, ErrNoPendingTask) {
+	if err := w.RunOnce(campaign.ID); !errors.Is(err, ErrNoPendingTask) {
 		t.Fatalf("before start RunOnce err=%v", err)
 	}
 	fake.Set(start)
-	if err := w.RunOnce(); err != nil {
+	if err := w.RunOnce(campaign.ID); err != nil {
 		t.Fatalf("at start RunOnce: %v", err)
 	}
 	var task models.WorkflowTask
@@ -116,16 +116,15 @@ func TestCampaignCreatesFirstWorkflowWhenFakeTimeReachesStart(t *testing.T) {
 func TestNextWorkflowWaitsForPreviousTerminalState(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	w, fake, db := setupWorkerTest(t, now)
-	start := now
-	campaign := insertApprovedCampaign(t, db, now, start, start.Add(15*24*time.Hour))
-	if err := w.RunOnce(); err != nil {
+	campaign := insertApprovedCampaign(t, db, now, now, now.Add(15*24*time.Hour))
+	if err := w.RunOnce(campaign.ID); err != nil {
 		t.Fatal(err)
 	}
 	var first models.WorkflowTask
 	if err := db.Where("campaign_id = ?", campaign.ID).First(&first).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := w.RunOnce(); !errors.Is(err, ErrNoPendingTask) {
+	if err := w.RunOnce(campaign.ID); !errors.Is(err, ErrNoPendingTask) {
 		t.Fatalf("second RunOnce while first runs = %v, want no task", err)
 	}
 	var count int64
@@ -134,15 +133,16 @@ func TestNextWorkflowWaitsForPreviousTerminalState(t *testing.T) {
 		t.Fatalf("tasks=%d before first terminal, want 1", count)
 	}
 
-	if err := db.Model(&models.WorkflowTask{}).Where("id = ?", first.ID).Update("status", models.WorkflowTaskStatusSuccess).Error; err != nil {
+	if err := db.Model(&models.WorkflowTask{}).Where("id = ?", first.ID).
+		Update("status", models.WorkflowTaskStatusSuccess).Error; err != nil {
 		t.Fatal(err)
 	}
 	fake.Set(first.EndTime.Add(-time.Nanosecond))
-	if err := w.RunOnce(); !errors.Is(err, ErrNoPendingTask) {
+	if err := w.RunOnce(campaign.ID); !errors.Is(err, ErrNoPendingTask) {
 		t.Fatalf("before next start RunOnce=%v, want no task", err)
 	}
 	fake.Set(first.EndTime)
-	if err := w.RunOnce(); err != nil {
+	if err := w.RunOnce(campaign.ID); err != nil {
 		t.Fatalf("at next start RunOnce: %v", err)
 	}
 	db.Model(&models.WorkflowTask{}).Where("campaign_id = ?", campaign.ID).Count(&count)
@@ -163,11 +163,11 @@ func TestCampaignCompletesAfterEndTime(t *testing.T) {
 	w, fake, db := setupWorkerTest(t, now)
 	end := now.Add(15 * 24 * time.Hour)
 	campaign := insertApprovedCampaign(t, db, now, now, end)
-	if err := w.RunOnce(); err != nil {
+	if err := w.RunOnce(campaign.ID); err != nil {
 		t.Fatal(err)
 	}
 	fake.Set(end)
-	if err := w.RunOnce(); !errors.Is(err, ErrNoPendingTask) {
+	if err := w.RunOnce(campaign.ID); !errors.Is(err, ErrNoPendingTask) {
 		t.Fatalf("RunOnce at end=%v, want no task", err)
 	}
 	var got models.Campaign

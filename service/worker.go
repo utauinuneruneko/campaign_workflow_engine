@@ -17,9 +17,10 @@ const WorkflowPeriod = 7 * 24 * time.Hour
 var ErrNoPendingTask = errors.New("no eligible pending task")
 
 type Worker struct {
-	db         *gorm.DB
-	clock      internal.Clock
-	campaigns  *repo.CampaignRepository
+	db        *gorm.DB
+	clock     internal.Clock
+	campaigns *repo.CampaignRepository
+	workflows *repo.WorkflowRepository
 }
 
 func NewWorker(db *gorm.DB, c internal.Clock) *Worker {
@@ -30,6 +31,7 @@ func NewWorker(db *gorm.DB, c internal.Clock) *Worker {
 		db:        db,
 		clock:     c,
 		campaigns: repo.NewCampaignRepository(db),
+		workflows: repo.NewWorkflowRepository(db),
 	}
 }
 
@@ -87,26 +89,36 @@ func validateBudgetInputs(
 	return nil
 }
 
-func (w *Worker) RunOnce() error {
+// RunOnce processes only the campaign identified by campaignID: it may complete
+// the campaign, create its next due task, and claim one due task for execution.
+func (w *Worker) RunOnce(campaignID int64) error {
+	if campaignID <= 0 {
+		return errors.New("campaign ID must be positive")
+	}
+
 	found := false
 	err := w.db.Transaction(func(tx *gorm.DB) error {
 		now := w.clock.Now()
-		if err := w.completeExpiredCampaigns(tx, now); err != nil {
+		campaign, err := w.campaigns.WithDB(tx).GetByID(campaignID)
+		if err != nil {
+			return err
+		}
+		if err := w.completeExpiredCampaign(tx, &campaign, now); err != nil {
 			return err
 		}
 
 		var task models.WorkflowTask
-		created, err := w.createNextDueTask(tx, now, &task)
+		created, err := w.createNextDueTask(tx, campaign, now, &task)
 		if err != nil {
 			return fmt.Errorf("create next workflow: %w", err)
 		}
-		if !created {
-			found, err = w.findDueTask(tx, now, &task)
+		if created {
+			found = true
+		} else {
+			found, err = w.findDueTask(tx, campaign, now, &task)
 			if err != nil {
 				return err
 			}
-		} else {
-			found = true
 		}
 		if !found {
 			return nil
@@ -122,21 +134,20 @@ func (w *Worker) RunOnce() error {
 	return nil
 }
 
-func (w *Worker) completeExpiredCampaigns(tx *gorm.DB, now time.Time) error {
-	campaigns, err := w.campaigns.WithDB(tx).List()
-	if err != nil {
-		return err
+func (w *Worker) completeExpiredCampaign(
+	tx *gorm.DB,
+	campaign *models.Campaign,
+	now time.Time,
+) error {
+	if !campaignEndReached(*campaign, now) {
+		return nil
 	}
-	for _, campaign := range campaigns {
-		if !campaignEndReached(campaign, now) {
-			continue
-		}
-		if _, err := w.campaigns.WithDB(tx).UpdateByID(campaign.ID, map[string]interface{}{
-			"status": models.CampaignStatusCompleted,
-		}); err != nil {
-			return fmt.Errorf("complete campaign %d: %w", campaign.ID, err)
-		}
+	if _, err := w.campaigns.WithDB(tx).UpdateByID(campaign.ID, map[string]interface{}{
+		"status": models.CampaignStatusCompleted,
+	}); err != nil {
+		return fmt.Errorf("complete campaign %d: %w", campaign.ID, err)
 	}
+	campaign.Status = models.CampaignStatusCompleted
 	return nil
 }
 
@@ -148,25 +159,19 @@ func campaignEndReached(campaign models.Campaign, now time.Time) bool {
 
 func (w *Worker) findDueTask(
 	tx *gorm.DB,
+	campaign models.Campaign,
 	now time.Time,
 	task *models.WorkflowTask,
 ) (bool, error) {
-	statuses := []models.CampaignStatus{
-		models.CampaignStatusApproved,
-		models.CampaignStatusDelivering,
+	if !campaignEligible(campaign, now) {
+		return false, nil
 	}
-	var tasks []models.WorkflowTask
-	if err := tx.Order("create_time ASC").Order("id ASC").Find(&tasks).Error; err != nil {
-		return false, fmt.Errorf("list workflow tasks: %w", err)
-	}
-	campaigns, err := w.campaigns.WithDB(tx).List()
+	tasks, err := w.workflows.WithDB(tx).List()
 	if err != nil {
 		return false, err
 	}
-	campaignByID := campaignMap(campaigns)
 	for _, candidate := range tasks {
-		campaign, exists := campaignByID[candidate.CampaignID]
-		if !exists || !workflowIsDue(candidate, campaign, statuses, now) {
+		if candidate.CampaignID != campaign.ID || !workflowIsDue(candidate, campaign, now) {
 			continue
 		}
 		*task = candidate
@@ -175,31 +180,14 @@ func (w *Worker) findDueTask(
 	return false, nil
 }
 
-func campaignMap(campaigns []models.Campaign) map[int64]models.Campaign {
-	result := make(map[int64]models.Campaign, len(campaigns))
-	for _, campaign := range campaigns {
-		result[campaign.ID] = campaign
-	}
-	return result
-}
-
 func workflowIsDue(
 	task models.WorkflowTask,
 	campaign models.Campaign,
-	eligibleStatuses []models.CampaignStatus,
 	now time.Time,
 ) bool {
-	if task.Status != models.WorkflowTaskStatusPending ||
-		task.StartTime.After(now) || !task.EndTime.After(now) ||
-		!campaign.EndTime.After(now) {
-		return false
-	}
-	for _, status := range eligibleStatuses {
-		if campaign.Status == status {
-			return true
-		}
-	}
-	return false
+	return task.Status == models.WorkflowTaskStatusPending &&
+		!task.StartTime.After(now) && task.EndTime.After(now) &&
+		campaign.EndTime.After(now)
 }
 
 func (w *Worker) claimTask(
@@ -207,17 +195,21 @@ func (w *Worker) claimTask(
 	now time.Time,
 	task models.WorkflowTask,
 ) error {
-	result := tx.Model(&models.WorkflowTask{}).
-		Where("id = ? AND status = ? AND start_time <= ?", task.ID, models.WorkflowTaskStatusPending, now).
-		Update("status", models.WorkflowTaskStatusRunning)
-	if result.Error != nil {
-		return fmt.Errorf("mark workflow running: %w", result.Error)
+	workflowRepo := w.workflows.WithDB(tx)
+	current, err := workflowRepo.GetByID(task.ID)
+	if err != nil {
+		return err
 	}
-	if result.RowsAffected == 0 {
+	if current.Status != models.WorkflowTaskStatusPending || current.StartTime.After(now) {
 		return nil
 	}
+	if _, err := workflowRepo.UpdateByID(current.ID, map[string]interface{}{
+		"status": models.WorkflowTaskStatusRunning,
+	}); err != nil {
+		return fmt.Errorf("mark workflow running: %w", err)
+	}
 
-	campaign, err := w.campaigns.WithDB(tx).GetByID(task.CampaignID)
+	campaign, err := w.campaigns.WithDB(tx).GetByID(current.CampaignID)
 	if err != nil {
 		return err
 	}
@@ -233,45 +225,25 @@ func (w *Worker) claimTask(
 
 func (w *Worker) createNextDueTask(
 	tx *gorm.DB,
+	campaign models.Campaign,
 	now time.Time,
 	task *models.WorkflowTask,
 ) (bool, error) {
-	campaigns, err := w.findEligibleCampaigns(tx, now)
+	if !campaignEligible(campaign, now) {
+		return false, nil
+	}
+	next, ready, err := w.nextTaskForCampaign(tx, campaign, now)
 	if err != nil {
 		return false, err
 	}
-	for _, campaign := range campaigns {
-		next, ready, err := w.nextTaskForCampaign(tx, campaign, now)
-		if err != nil {
-			return false, err
-		}
-		if !ready {
-			continue
-		}
-		if err := tx.Create(&next).Error; err != nil {
-			return false, fmt.Errorf("create next workflow: %w", err)
-		}
-		*task = next
-		return true, nil
+	if !ready {
+		return false, nil
 	}
-	return false, nil
-}
-
-func (w *Worker) findEligibleCampaigns(
-	tx *gorm.DB,
-	now time.Time,
-) ([]models.Campaign, error) {
-	campaigns, err := w.campaigns.WithDB(tx).List()
-	if err != nil {
-		return nil, err
+	if err := w.workflows.WithDB(tx).Create(&next); err != nil {
+		return false, fmt.Errorf("create next workflow: %w", err)
 	}
-	eligible := make([]models.Campaign, 0, len(campaigns))
-	for _, campaign := range campaigns {
-		if campaignEligible(campaign, now) {
-			eligible = append(eligible, campaign)
-		}
-	}
-	return eligible, nil
+	*task = next
+	return true, nil
 }
 
 func campaignEligible(campaign models.Campaign, now time.Time) bool {
@@ -302,6 +274,7 @@ func (w *Worker) nextTaskForCampaign(
 	if err != nil {
 		return models.WorkflowTask{}, false, err
 	}
+
 	remainingDuration := campaign.EndTime.Sub(startAt)
 	totalDuration := campaign.EndTime.Sub(campaign.StartTime)
 	budget, err := CalculateNextWorkflowBudget(
@@ -337,18 +310,29 @@ func (w *Worker) findPreviousTask(
 	tx *gorm.DB,
 	campaignID int64,
 ) (models.WorkflowTask, bool, error) {
-	var previous models.WorkflowTask
-	err := tx.Where("campaign_id = ?", campaignID).
-		Order("start_time DESC").
-		Order("id DESC").
-		First(&previous).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return models.WorkflowTask{}, true, nil
-	}
+	tasks, err := w.workflows.WithDB(tx).List()
 	if err != nil {
 		return models.WorkflowTask{}, false, err
 	}
-	return previous, false, nil
+	var previous models.WorkflowTask
+	found := false
+	for _, task := range tasks {
+		if task.CampaignID != campaignID {
+			continue
+		}
+		if !found || taskIsLater(task, previous) {
+			previous = task
+			found = true
+		}
+	}
+	return previous, !found, nil
+}
+
+func taskIsLater(candidate, current models.WorkflowTask) bool {
+	if candidate.StartTime.Equal(current.StartTime) {
+		return candidate.ID > current.ID
+	}
+	return candidate.StartTime.After(current.StartTime)
 }
 
 func workflowWindow(
@@ -358,25 +342,39 @@ func workflowWindow(
 	now time.Time,
 ) (time.Time, time.Duration, bool) {
 	startAt := campaign.StartTime
-	totalDuration := campaign.EndTime.Sub(campaign.StartTime)
-	remainingDuration := campaign.EndTime.Sub(startAt)
-	duration := WorkflowPeriod + totalDuration%WorkflowPeriod
+	duration := WorkflowPeriod
+
 	if !isFirst {
 		if previous.Status != models.WorkflowTaskStatusSuccess &&
 			previous.Status != models.WorkflowTaskStatusFailed {
 			return time.Time{}, 0, false
 		}
-		startAt = previous.EndTime
-		if startAt.After(now) || !startAt.Before(campaign.EndTime) {
-			return time.Time{}, 0, false
-		}
-		remainingDuration = campaign.EndTime.Sub(startAt)
-		duration = WorkflowPeriod
+
+		// Start the next workflow as soon as the previous task is terminal.
+		startAt = now
 	}
+
+	if startAt.Before(campaign.StartTime) {
+		startAt = campaign.StartTime
+	}
+
+	remainingDuration := campaign.EndTime.Sub(startAt)
+	if remainingDuration < WorkflowPeriod {
+		return time.Time{}, 0, false
+	}
+
+	if isFirst {
+		// Preserve the existing first-task policy: include the campaign's
+		// partial-week remainder in the first workflow's duration.
+		totalDuration := campaign.EndTime.Sub(campaign.StartTime)
+		duration += totalDuration % WorkflowPeriod
+	}
+
 	if duration > remainingDuration {
 		duration = remainingDuration
 	}
-	return startAt, duration, duration > 0
+
+	return startAt, duration, duration >= WorkflowPeriod
 }
 
 func (w *Worker) remainingBudget(
@@ -387,22 +385,29 @@ func (w *Worker) remainingBudget(
 	if isFirst {
 		return campaign.Budget, nil
 	}
+	tasks, err := w.workflows.WithDB(tx).List()
+	if err != nil {
+		return 0, err
+	}
 	var allocated int64
-	if err := tx.Model(&models.WorkflowTask{}).
-		Where("campaign_id = ?", campaign.ID).
-		Select("COALESCE(SUM(budget), 0)").
-		Scan(&allocated).Error; err != nil {
-		return 0, fmt.Errorf("sum allocated workflow budgets: %w", err)
+	for _, task := range tasks {
+		if task.CampaignID == campaign.ID {
+			allocated += task.Budget
+		}
 	}
 	return campaign.Budget - allocated, nil
 }
 
 func (w *Worker) taskSequence(tx *gorm.DB, campaignID int64) (int64, error) {
+	tasks, err := w.workflows.WithDB(tx).List()
+	if err != nil {
+		return 0, err
+	}
 	var sequence int64
-	if err := tx.Model(&models.WorkflowTask{}).
-		Where("campaign_id = ?", campaignID).
-		Count(&sequence).Error; err != nil {
-		return 0, fmt.Errorf("count campaign workflows: %w", err)
+	for _, task := range tasks {
+		if task.CampaignID == campaignID {
+			sequence++
+		}
 	}
 	return sequence, nil
 }

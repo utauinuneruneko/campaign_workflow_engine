@@ -21,16 +21,18 @@ var (
 )
 
 type CampaignService struct {
-	db   *gorm.DB
-	now  func() time.Time
-	repo *repo.CampaignRepository
+	db        *gorm.DB
+	now       func() time.Time
+	repo      *repo.CampaignRepository
+	workflows *repo.WorkflowRepository
 }
 
 func NewCampaignService(db *gorm.DB) *CampaignService {
 	return &CampaignService{
-		db:   db,
-		now:  time.Now,
-		repo: repo.NewCampaignRepository(db),
+		db:        db,
+		now:       time.Now,
+		repo:      repo.NewCampaignRepository(db),
+		workflows: repo.NewWorkflowRepository(db),
 	}
 }
 
@@ -45,7 +47,6 @@ func (s *CampaignService) Submit(ctx context.Context, campaignID int64) error {
 		if campaign.Status != models.CampaignStatusDraft {
 			return ErrInvalidTransition
 		}
-
 		_, err = campaignRepo.UpdateByID(campaignID, map[string]interface{}{
 			"status":       models.CampaignStatusSubmitted,
 			"submitted_at": now,
@@ -87,7 +88,7 @@ func (s *CampaignService) Approve(ctx context.Context, campaignID int64) error {
 		if now.Before(campaign.StartTime) {
 			return nil
 		}
-		return createInitialTask(tx, campaign)
+		return s.createInitialTaskIfMissing(tx, campaign)
 	})
 	if err != nil {
 		return err
@@ -110,21 +111,25 @@ func (s *CampaignService) CreateInitialTaskIfDue(ctx context.Context, campaignID
 		if s.now().Before(campaign.StartTime) {
 			return ErrCampaignNotStarted
 		}
-		return createInitialTask(tx, campaign)
+		return s.createInitialTaskIfMissing(tx, campaign)
 	})
 }
 
-func createInitialTask(tx *gorm.DB, campaign models.Campaign) error {
-	var count int64
-	if err := tx.Model(&models.WorkflowTask{}).
-		Where("campaign_id = ?", campaign.ID).
-		Count(&count).Error; err != nil {
+func (s *CampaignService) createInitialTaskIfMissing(
+	tx *gorm.DB,
+	campaign models.Campaign,
+) error {
+	tasks, err := s.workflows.WithDB(tx).List()
+	if err != nil {
 		return err
 	}
-	if count != 0 {
-		return nil
+	for _, task := range tasks {
+		if task.CampaignID == campaign.ID {
+			return nil
+		}
 	}
-	workflow := models.WorkflowTask{
+
+	initialTask := models.WorkflowTask{
 		CampaignID:     campaign.ID,
 		Status:         models.WorkflowTaskStatusPending,
 		StartTime:      campaign.StartTime,
@@ -132,7 +137,7 @@ func createInitialTask(tx *gorm.DB, campaign models.Campaign) error {
 		Budget:         campaign.Budget,
 		IdempotencyKey: fmt.Sprintf("campaign-%d-initial-workflow", campaign.ID),
 	}
-	return tx.Create(&workflow).Error
+	return s.workflows.WithDB(tx).Create(&initialTask)
 }
 
 func (s *CampaignService) ExpireSubmissions(ctx context.Context) (int64, error) {

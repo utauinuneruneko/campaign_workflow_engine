@@ -3,13 +3,14 @@ package handler
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/utauinuneruneko/campaign_workflow_engine/models"
 	"github.com/utauinuneruneko/campaign_workflow_engine/repo"
 	"gorm.io/gorm"
-	"net/http"
-	"strconv"
-	"time"
 )
 
 type workflowDeliveryRequest struct {
@@ -61,24 +62,30 @@ func (h *WorkerHandler) recordDelivery(
 	if err != nil {
 		return err
 	}
-	if err := validateDelivery(task, campaign, amount, time.Now()); err != nil {
+	now := time.Now()
+	if err := validateDelivery(task, campaign, amount, now); err != nil {
 		return err
 	}
 	if err := recordWorkflowSpend(tx, task, amount); err != nil {
 		return err
 	}
-	if err := recordCampaignSpend(tx, campaign, amount, time.Now()); err != nil {
+	if err := recordCampaignSpend(tx, campaign, amount, now); err != nil {
 		return err
 	}
-	return tx.First(updated, task.ID).Error
+	updatedTask, err := repo.NewWorkflowRepository(tx).GetByID(task.ID)
+	if err != nil {
+		return fmt.Errorf("reload workflow task: %w", err)
+	}
+	*updated = updatedTask
+	return nil
 }
 
 func (h *WorkerHandler) loadDeliveryEntities(
 	tx *gorm.DB,
 	workflowID int64,
 ) (models.WorkflowTask, models.Campaign, error) {
-	var task models.WorkflowTask
-	if err := tx.First(&task, workflowID).Error; err != nil {
+	task, err := repo.NewWorkflowRepository(tx).GetByID(workflowID)
+	if err != nil {
 		return models.WorkflowTask{}, models.Campaign{}, err
 	}
 	campaign, err := repo.NewCampaignRepository(tx).GetByID(task.CampaignID)
@@ -116,25 +123,24 @@ func recordWorkflowSpend(
 	task models.WorkflowTask,
 	amount int64,
 ) error {
+	if task.Status != models.WorkflowTaskStatusRunning {
+		return errWorkflowNotRunning
+	}
+	if amount > task.Budget-task.SpentBudget {
+		return errSpendExceedsWorkflowBudget
+	}
+
 	updates := map[string]interface{}{
-		"spent_budget": gorm.Expr("spent_budget + ?", amount),
+		"spent_budget": task.SpentBudget + amount,
 	}
 	if task.SpentBudget+amount >= task.Budget {
 		updates["status"] = models.WorkflowTaskStatusSuccess
 	}
-
-	result := tx.Model(&models.WorkflowTask{}).
-		Where(
-			"id = ? AND status = ? AND spent_budget + ? <= budget",
-			task.ID,
-			models.WorkflowTaskStatusRunning,
-			amount,
-		).
-		Updates(updates)
-	if result.Error != nil {
-		return fmt.Errorf("record workflow spend: %w", result.Error)
+	rows, err := repo.NewWorkflowRepository(tx).UpdateByID(task.ID, updates)
+	if err != nil {
+		return fmt.Errorf("record workflow spend: %w", err)
 	}
-	if result.RowsAffected == 0 {
+	if rows == 0 {
 		return errSpendExceedsWorkflowBudget
 	}
 	return nil
@@ -153,7 +159,7 @@ func recordCampaignSpend(
 	}
 
 	rows, err := repo.NewCampaignRepository(tx).UpdateByID(campaign.ID, map[string]interface{}{
-		"spent_budget": gorm.Expr("spent_budget + ?", amount),
+		"spent_budget": campaign.SpentBudget + amount,
 	})
 	if err != nil {
 		return fmt.Errorf("record campaign spend: %w", err)
