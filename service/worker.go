@@ -342,25 +342,39 @@ func workflowWindow(
 	now time.Time,
 ) (time.Time, time.Duration, bool) {
 	startAt := campaign.StartTime
-	totalDuration := campaign.EndTime.Sub(campaign.StartTime)
-	remainingDuration := campaign.EndTime.Sub(startAt)
-	duration := WorkflowPeriod + totalDuration%WorkflowPeriod
+	duration := WorkflowPeriod
+
 	if !isFirst {
 		if previous.Status != models.WorkflowTaskStatusSuccess &&
 			previous.Status != models.WorkflowTaskStatusFailed {
 			return time.Time{}, 0, false
 		}
-		startAt = previous.EndTime
-		if startAt.After(now) || !startAt.Before(campaign.EndTime) {
-			return time.Time{}, 0, false
-		}
-		remainingDuration = campaign.EndTime.Sub(startAt)
-		duration = WorkflowPeriod
+
+		// Start the next workflow as soon as the previous task is terminal.
+		startAt = now
 	}
+
+	if startAt.Before(campaign.StartTime) {
+		startAt = campaign.StartTime
+	}
+
+	remainingDuration := campaign.EndTime.Sub(startAt)
+	if remainingDuration < WorkflowPeriod {
+		return time.Time{}, 0, false
+	}
+
+	if isFirst {
+		// Preserve the existing first-task policy: include the campaign's
+		// partial-week remainder in the first workflow's duration.
+		totalDuration := campaign.EndTime.Sub(campaign.StartTime)
+		duration += totalDuration % WorkflowPeriod
+	}
+
 	if duration > remainingDuration {
 		duration = remainingDuration
 	}
-	return startAt, duration, duration > 0
+
+	return startAt, duration, duration >= WorkflowPeriod
 }
 
 func (w *Worker) remainingBudget(
