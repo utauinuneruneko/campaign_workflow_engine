@@ -82,13 +82,17 @@ type WorkflowTask struct {
 	Budget         int64              `gorm:"not null;default:0" json:"budget"`
 	SpentBudget    int64              `gorm:"not null;default:0" json:"spent_budget"`
 	StartTime      time.Time          `gorm:"index" json:"start_time"`
-	EndTime        time.Time          `gorm:"index" json:"end_time"`
-	IdempotencyKey string             `gorm:"size:128;not null;uniqueIndex" json:"idempotency_key"`
-	RetryCount     int                `gorm:"not null;default:0" json:"retry_count"`
-	MaxRetries     int                `gorm:"not null;default:3" json:"max_retries"`
-	ErrorMessage   string             `gorm:"size:512" json:"error_message"`
-	CreateTime     time.Time          `gorm:"column:create_time;autoCreateTime" json:"create_time"`
-	ModifyTime     time.Time          `gorm:"column:modify_time;autoUpdateTime" json:"modify_time"`
+	// EndTime is the scheduled end of this workflow window.
+	EndTime time.Time `gorm:"index" json:"end_time"`
+	// ActualEndTime records when the task actually reached a terminal state.
+	// It remains nil while the task is pending or running.
+	ActualEndTime  *time.Time `gorm:"index" json:"actual_end_time,omitempty"`
+	IdempotencyKey string     `gorm:"size:128;not null;uniqueIndex" json:"idempotency_key"`
+	RetryCount     int        `gorm:"not null;default:0" json:"retry_count"`
+	MaxRetries     int        `gorm:"not null;default:3" json:"max_retries"`
+	ErrorMessage   string     `gorm:"size:512" json:"error_message"`
+	CreateTime     time.Time  `gorm:"column:create_time;autoCreateTime" json:"create_time"`
+	ModifyTime     time.Time  `gorm:"column:modify_time;autoUpdateTime" json:"modify_time"`
 }
 
 func (t *WorkflowTask) BeforeSave(*gorm.DB) error {

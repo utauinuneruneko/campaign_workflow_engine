@@ -66,12 +66,13 @@ func (h *WorkerHandler) recordDelivery(
 	if err := validateDelivery(task, campaign, amount, now); err != nil {
 		return err
 	}
-	if err := recordWorkflowSpend(tx, task, amount); err != nil {
+	if err := recordWorkflowSpend(tx, task, amount, now); err != nil {
 		return err
 	}
 	if err := recordCampaignSpend(tx, campaign, amount, now); err != nil {
 		return err
 	}
+
 	updatedTask, err := repo.NewWorkflowRepository(tx).GetByID(task.ID)
 	if err != nil {
 		return fmt.Errorf("reload workflow task: %w", err)
@@ -122,6 +123,7 @@ func recordWorkflowSpend(
 	tx *gorm.DB,
 	task models.WorkflowTask,
 	amount int64,
+	now time.Time,
 ) error {
 	if task.Status != models.WorkflowTaskStatusRunning {
 		return errWorkflowNotRunning
@@ -135,6 +137,7 @@ func recordWorkflowSpend(
 	}
 	if task.SpentBudget+amount >= task.Budget {
 		updates["status"] = models.WorkflowTaskStatusSuccess
+		updates["actual_end_time"] = now
 	}
 	rows, err := repo.NewWorkflowRepository(tx).UpdateByID(task.ID, updates)
 	if err != nil {
@@ -159,7 +162,7 @@ func recordCampaignSpend(
 	}
 
 	rows, err := repo.NewCampaignRepository(tx).UpdateByID(campaign.ID, map[string]interface{}{
-		"spent_budget": campaign.SpentBudget + amount,
+		"spent_budget": gorm.Expr("spent_budget + ?", amount),
 	})
 	if err != nil {
 		return fmt.Errorf("record campaign spend: %w", err)
